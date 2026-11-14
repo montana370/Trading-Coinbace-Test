@@ -197,6 +197,26 @@ def required_history_1m(c: "StrategyConfig") -> int:
 
 
 @dataclass(frozen=True)
+class TrendConfig:
+    """
+    Seguimiento de tendencia en velas de 6 h (validado en docs/BACKTEST.md):
+    entrada si el cierre supera el máximo de `n_entry` velas y la EMA(200);
+    stop inicial y trailing a `k_atr`·ATR(14) desde el máximo; salida si el
+    cierre cae bajo el mínimo de `n_exit` velas. Sin TP fijo.
+    """
+    tf_seconds: int = 21600
+    granularity: str = "SIX_HOUR"
+    n_entry: int = _env_int("TREND_N_ENTRY", 20)
+    n_exit: int = _env_int("TREND_N_EXIT", 20)
+    k_atr: float = _env_float("TREND_K_ATR", 5.0)
+    ema_period: int = 200
+    atr_period: int = 14
+    history_bars: int = 300                  # 75 días de velas de 6 h
+    entry_window_s: int = 1800               # la señal sólo es válida 30 min tras el cierre
+    far_tp_multiple: float = 4.0             # TP del bracket (sólo para alojar el stop en el exchange)
+
+
+@dataclass(frozen=True)
 class OracleConfig:
     window_s: int = 300
     max_drop_pct: float = _env_float("ORACLE_MAX_DROP_PCT", 0.60)    # caída 5m %
@@ -245,6 +265,11 @@ class Settings:
     execution: ExecutionConfig = field(default_factory=ExecutionConfig)
     strategy: StrategyConfig = field(default_factory=StrategyConfig)
     oracle: OracleConfig = field(default_factory=OracleConfig)
+    trend: TrendConfig = field(default_factory=TrendConfig)
+    # Estrategias activas (coma): TREND_6H | BREAKOUT_ORDERFLOW | MEAN_REVERSION_MICRO
+    strategies: tuple[str, ...] = tuple(
+        x.strip().upper() for x in _env_str("STRATEGIES", "TREND_6H").split(",") if x.strip()
+    )
     risk: RiskConfig = field(default_factory=RiskConfig)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
     pairs: dict[str, PairConfig] = field(default_factory=lambda: dict(PAIRS))

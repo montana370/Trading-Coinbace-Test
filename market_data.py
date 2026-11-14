@@ -221,6 +221,7 @@ class MarketState:
     def __post_init__(self) -> None:
         self.book = OrderBook(self.product_id)
         self.bars = deque(maxlen=self.max_bars)
+        self.htf = HTFBars(21600)
 
     # ── ingesta ─────────────────────────────────────────────────────────────
     def seed_candles(self, candles: list[dict]) -> None:
@@ -248,6 +249,7 @@ class MarketState:
     def on_trade(self, ts: float, price: float, size: float, aggressor_buy: bool) -> None:
         signed = size if aggressor_buy else -size
         self.trades.append(TradeTick(ts, price, size, signed))
+        self.htf.on_trade(ts, price, size)
         self.cvd_total += signed
         self.last_price = price
         self.last_trade_ts = ts
@@ -347,6 +349,44 @@ class MarketState:
     @property
     def is_ready(self) -> bool:
         return self.book.initialized and not math.isnan(self.last_price)
+
+
+class HTFBars:
+    """Velas de temporalidad alta (p. ej. 6 h) sembradas por REST y actualizadas con trades."""
+
+    def __init__(self, tf_seconds: int, maxlen: int = 600) -> None:
+        self.tf = tf_seconds
+        self.bars: deque[Bar] = deque(maxlen=maxlen)
+
+    def seed(self, candles: list[dict]) -> None:
+        for c in sorted(candles, key=lambda c: int(c["start"])):
+            start = float(c["start"])
+            if self.bars and start <= self.bars[-1].start:
+                continue
+            self.bars.append(Bar(start, float(c["open"]), float(c["high"]), float(c["low"]),
+                                 float(c["close"]), float(c["volume"])))
+
+    def on_trade(self, ts: float, price: float, size: float) -> None:
+        bucket = math.floor(ts / self.tf) * self.tf
+        if not self.bars or bucket > self.bars[-1].start:
+            self.bars.append(Bar(bucket, price, price, price, price))
+        b = self.bars[-1]
+        if bucket < b.start:
+            return
+        b.high, b.low, b.close = max(b.high, price), min(b.low, price), price
+        b.volume += size
+
+    def closed(self, now: float | None = None) -> dict[str, np.ndarray]:
+        """Series de velas CERRADAS (excluye la vela en curso)."""
+        now = now or time.time()
+        bars = [b for b in self.bars if b.start + self.tf <= now]
+        return {
+            "start": np.array([b.start for b in bars], dtype=float),
+            "open": np.array([b.open for b in bars], dtype=float),
+            "high": np.array([b.high for b in bars], dtype=float),
+            "low": np.array([b.low for b in bars], dtype=float),
+            "close": np.array([b.close for b in bars], dtype=float),
+        }
 
 
 class SequenceTracker:

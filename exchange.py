@@ -106,7 +106,8 @@ class Gateway(ABC):
     async def load_products(self, product_ids: list[str]) -> dict[str, ProductMeta]: ...
 
     @abstractmethod
-    async def get_candles(self, product_id: str, minutes: int) -> list[dict[str, Any]]: ...
+    async def get_candles(self, product_id: str, minutes: int, granularity: str = "ONE_MINUTE",
+                          seconds: int = 60) -> list[dict[str, Any]]: ...
 
     @abstractmethod
     async def get_balances(self) -> dict[str, float]: ...
@@ -176,8 +177,9 @@ class CoinbaseGateway(Gateway):
             )
         return self.products
 
-    async def get_candles(self, product_id: str, minutes: int) -> list[dict[str, Any]]:
-        return await _fetch_candles(self._call, self.client.get_candles, product_id, minutes)
+    async def get_candles(self, product_id: str, minutes: int, granularity: str = "ONE_MINUTE",
+                          seconds: int = 60) -> list[dict[str, Any]]:
+        return await _fetch_candles(self._call, self.client.get_candles, product_id, minutes, granularity, seconds)
 
     async def get_balances(self) -> dict[str, float]:
         out: dict[str, float] = {}
@@ -287,21 +289,23 @@ class CoinbaseGateway(Gateway):
 
 
 async def _fetch_candles(
-    caller: Callable[..., Awaitable[dict[str, Any]]], fn: Callable[..., Any], product_id: str, minutes: int
+    caller: Callable[..., Awaitable[dict[str, Any]]], fn: Callable[..., Any], product_id: str, minutes: int,
+    granularity: str = "ONE_MINUTE", seconds: int = 60,
 ) -> list[dict[str, Any]]:
-    """Descarga velas ONE_MINUTE paginando de 300 en 300 (límite API = 350)."""
+    """Descarga velas paginando de 300 en 300 (límite API = 350), con backoff ante 429."""
     end = datetime.now(timezone.utc)
     start_limit = end - timedelta(minutes=minutes)
     out: list[dict[str, Any]] = []
     cursor_end = end
     while cursor_end > start_limit:
-        chunk_start = max(cursor_end - timedelta(minutes=300), start_limit)
+        chunk_start = max(cursor_end - timedelta(seconds=300 * seconds), start_limit)
+        resp: dict[str, Any] = {}
         for attempt in range(6):
             try:
                 resp = await caller(
                     fn, product_id=product_id,
                     start=str(int(chunk_start.timestamp())), end=str(int(cursor_end.timestamp())),
-                    granularity="ONE_MINUTE",
+                    granularity=granularity,
                 )
                 break
             except Exception as exc:  # noqa: BLE001
@@ -387,8 +391,10 @@ class PaperGateway(Gateway):
             )
         return self.products
 
-    async def get_candles(self, product_id: str, minutes: int) -> list[dict[str, Any]]:
-        return await _fetch_candles(self._call, self.public.get_public_candles, product_id, minutes)
+    async def get_candles(self, product_id: str, minutes: int, granularity: str = "ONE_MINUTE",
+                          seconds: int = 60) -> list[dict[str, Any]]:
+        return await _fetch_candles(self._call, self.public.get_public_candles, product_id, minutes,
+                                    granularity, seconds)
 
     async def get_balances(self) -> dict[str, float]:
         return dict(self.balances)

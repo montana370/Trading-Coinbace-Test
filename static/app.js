@@ -8,7 +8,7 @@ const PRICE_DEC = { BTC: 2, ETH: 2, SOL: 2, SUI: 4 };
 const TFS = ["1m", "5m", "15m", "1h", "6h", "1d"];
 
 const S = {
-  tab: "home", asset: "SOL-USDC", tf: "15m", data: null, assetData: null,
+  tab: "home", asset: "SOL-USDC", tf: "6h", data: null, assetData: null,
   selectedTrade: null, polling: null, chart: null, candleSeries: null, volSeries: null,
   priceLines: [], lastBar: null, tfSeconds: 900, candlesTimer: null, equityChart: null,
   portfolio: null, creds: null, events: [], built: {},
@@ -178,19 +178,23 @@ function assetRow(p) {
     <div class="asset-price"><div class="num">${fpx(p.product_id, p.price)}</div><div class="faint" style="font-size:11px">OBI ${fsign(p.obi)}</div></div></div>`;
 }
 
+const isTrend = (p) => p.strategy === "TREND_6H";
 function positionCard(p) {
-  const pid = p.product_id, lo = Math.min(p.stop_price, p.mark_price), hi = Math.max(p.take_profit, p.mark_price);
+  const trend = isTrend(p);
+  const top = trend ? Math.max(p.mark_price, p.entry_price) * 1.08 : p.take_profit;
+  const pid = p.product_id, lo = Math.min(p.stop_price, p.mark_price), hi = Math.max(top, p.mark_price);
   const pos = (v) => Math.max(0, Math.min(100, ((v - lo) / (hi - lo || 1)) * 100));
   return `<div class="card"><div class="pos-head"><div class="row" style="gap:10px">${coin(pid)}<div><div style="font-weight:600">${esc(base(pid))} · LONG</div>
       <div class="faint" style="font-size:12px">${esc(p.strategy)} · ${dt(p.opened_at)}</div></div></div>
       <div style="text-align:right"><div class="pos-pnl ${cls(p.unrealized_net)}">${fsign(p.unrealized_net)}</div><div class="faint" style="font-size:11px">PnL neto flotante</div></div></div>
     <div class="range"><b style="left:${pos(p.stop_price)}%;background:var(--down)"></b><b style="left:${pos(p.entry_price)}%;background:var(--accent)"></b>
-      <b style="left:${pos(p.mark_price)}%;background:var(--text)"></b><b style="left:${pos(p.take_profit)}%;background:var(--up)"></b>
-      <em style="left:${pos(p.stop_price)}%">SL</em>${Math.min(Math.abs(pos(p.entry_price) - pos(p.stop_price)), Math.abs(pos(p.take_profit) - pos(p.entry_price))) > 18 ? `<em style="left:${pos(p.entry_price)}%">Entrada</em>` : ""}<em style="left:${pos(p.take_profit)}%">TP</em></div>
+      <b style="left:${pos(p.mark_price)}%;background:var(--text)"></b>${trend ? "" : `<b style="left:${pos(p.take_profit)}%;background:var(--up)"></b>`}
+      <em style="left:${pos(p.stop_price)}%">${trend ? "Trailing" : "SL"}</em>${Math.min(Math.abs(pos(p.entry_price) - pos(p.stop_price)), Math.abs(pos(top) - pos(p.entry_price))) > 18 ? `<em style="left:${pos(p.entry_price)}%">Entrada</em>` : ""}${trend ? "" : `<em style="left:${pos(p.take_profit)}%">TP</em>`}</div>
     <div class="kv"><span>Entrada · Tamaño</span><span>${fpx(pid, p.entry_price)} · ${Number(p.size).toPrecision(6)}</span></div>
     <div class="kv"><span>Precio actual</span><span>${fpx(pid, p.mark_price)}</span></div>
-    <div class="kv"><span>Stop Loss</span><span class="down">${fpx(pid, p.stop_price)} (${fpct(-p.dist_sl_pct)})</span></div>
-    <div class="kv"><span>Take Profit</span><span class="up">${fpx(pid, p.take_profit)} (${fpct(p.dist_tp_pct)})</span></div>
+    <div class="kv"><span>${trend ? "Stop (trailing)" : "Stop Loss"}</span><span class="down">${fpx(pid, p.stop_price)} (${fpct(-p.dist_sl_pct)})</span></div>
+    ${trend ? `<div class="kv"><span>Salida</span><span>trailing 5×ATR(6h) o cierre bajo el canal</span></div>`
+      : `<div class="kv"><span>Take Profit</span><span class="up">${fpx(pid, p.take_profit)} (${fpct(p.dist_tp_pct)})</span></div>`}
     <div class="kv"><span>Breakeven (fees)</span><span>${fpx(pid, p.breakeven_price)} ${p.breakeven_armed ? "🛡️" : ""}</span></div></div>`;
 }
 
@@ -287,12 +291,17 @@ function renderAssetDetail(p) {
   $("#a-metrics").innerHTML = `
     <div class="kv"><span>Spread / máx</span><span class="${sp != null && sp <= p.max_spread_pct ? "up" : "down"}">${sp != null ? sp.toFixed(3) : "—"}% / ${p.max_spread_pct}%</span></div>
     <div class="kv"><span>OBI L2 (±0.10%)</span><span>${fsign(p.obi)}</span></div><div style="padding:2px 0 8px">${obiBar(p.obi)}</div>
-    <div class="kv"><span>ATR (${tfLabel()})</span><span>${fpx(pid, p.atr)} (${p.atr_pct != null ? p.atr_pct.toFixed(2) : "—"}%)</span></div>
-    <div class="kv"><span>Hurst · ADX</span><span>${p.hurst != null ? p.hurst.toFixed(2) : "—"} · ${p.adx != null ? p.adx.toFixed(1) : "—"}</span></div>
+    <div class="kv"><span>ATR (régimen 5m)</span><span>${fpx(pid, p.atr)} (${p.atr_pct != null ? p.atr_pct.toFixed(2) : "—"}%)</span></div>
+    <div class="kv"><span>Hurst · ADX (5m)</span><span>${p.hurst != null ? p.hurst.toFixed(2) : "—"} · ${p.adx != null ? p.adx.toFixed(1) : "—"}</span></div>
     <div class="kv"><span>VWAP sesión</span><span>${fpx(pid, p.vwap)}</span></div>
     <div class="kv"><span>CVD 5m</span><span class="${cls(p.cvd_5m)}">${fsign(p.cvd_5m, 3)}</span></div>
+    ${p.trend_entry_level != null ? `
+    <div class="kv"><span>Nivel de ruptura (máx. 20×6h)</span><span>${fpx(pid, p.trend_entry_level)} (${fpct((p.trend_entry_level - p.price) / p.price * 100)})</span></div>
+    <div class="kv"><span>EMA 200 (6h)</span><span class="${p.price > p.trend_ema ? "up" : "down"}">${fpx(pid, p.trend_ema)}</span></div>
+    <div class="kv"><span>Salida de canal (mín. 20×6h)</span><span>${fpx(pid, p.trend_exit_level)}</span></div>
+    <div class="kv"><span>ATR (6h)</span><span>${fpx(pid, p.trend_atr)}</span></div>` : `
     <div class="kv"><span>Recorrido proyectado</span><span>${p.projected_move_pct != null ? p.projected_move_pct.toFixed(2) + "%" : "—"}</span></div>
-    <div class="kv"><span>Filtro comisiones</span><span class="${p.fee_filter_ok ? "up" : "down"}">${p.fee_filter_ok ? "PASA" : "BLOQUEA"}</span></div>
+    <div class="kv"><span>Filtro comisiones</span><span class="${p.fee_filter_ok ? "up" : "down"}">${p.fee_filter_ok ? "PASA" : "BLOQUEA"}</span></div>`}
     <div class="kv"><span>Asignación máx</span><span>${(p.max_allocation * 100).toFixed(0)}%</span></div>
     <div class="notice" style="margin-top:8px">${esc(p.signal || "—")}</div>`;
   const a = S.assetData;
@@ -377,17 +386,27 @@ function applyOverlays() {
     if (p) {
       markers.push({ time: barTime(p.opened_at), position: "belowBar", color: css("--accent"), shape: "arrowUp", text: "Entrada" });
       line(p.entry_price, css("--accent"), "Entrada", 0, 2);
-      line(p.stop_price, css("--down"), p.breakeven_armed ? "SL (trailing)" : "SL", 0, 2);
-      (p.tp_levels || []).forEach((lv, i) => line(lv.price, css("--up"), `TP${i + 1} ${(lv.fraction * 100).toFixed(0)}%${lv.filled ? " ✓" : ""}`));
-      if (!p.tp_levels || !p.tp_levels.length) line(p.take_profit, css("--up"), "TP");
-      line(p.breakeven_price, css("--warn"), "BE", 1);
+      if (isTrend(p)) {
+        line(p.stop_price, css("--down"), "Trailing 5×ATR", 0, 2);
+      } else {
+        line(p.stop_price, css("--down"), p.breakeven_armed ? "SL (trailing)" : "SL", 0, 2);
+        (p.tp_levels || []).forEach((lv, i) => line(lv.price, css("--up"), `TP${i + 1} ${(lv.fraction * 100).toFixed(0)}%${lv.filled ? " ✓" : ""}`));
+        if (!p.tp_levels || !p.tp_levels.length) line(p.take_profit, css("--up"), "TP");
+        line(p.breakeven_price, css("--warn"), "BE", 1);
+      }
     }
+    const pr = S.data && S.data.pairs.find((x) => x.product_id === pid);
+    if (pr && pr.trend_entry_level != null && !p) {
+      line(pr.trend_entry_level, css("--accent"), "Ruptura 6h", 3);
+      line(pr.trend_ema, css("--violet"), "EMA200", 3);
+    }
+    if (pr && pr.trend_exit_level != null && p && isTrend(p)) line(pr.trend_exit_level, css("--warn"), "Salida canal", 3);
     const sel = a.trades.find((t) => t.trade_id === S.selectedTrade);
     if (sel) {
       line(sel.entry_price, css("--accent"), "Entrada", 1);
       line(sel.exit_price, sel.net_pnl >= 0 ? css("--up") : css("--down"), "Salida", 1);
       if (sel.initial_stop != null) line(sel.initial_stop, css("--down"), "SL", 1);
-      if (sel.take_profit != null) line(sel.take_profit, css("--up"), "TP", 1);
+      if (sel.take_profit != null && sel.strategy !== "TREND_6H") line(sel.take_profit, css("--up"), "TP", 1);
     }
   }
   markers.sort((x, y) => x.time - y.time);

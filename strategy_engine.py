@@ -23,7 +23,7 @@ from typing import Any
 import numpy as np
 
 import indicators as ind
-from config import ORACLE_PRODUCT, FeeConfig, OracleConfig, PairConfig, StrategyConfig
+from config import ORACLE_PRODUCT, FeeConfig, OracleConfig, PairConfig, StrategyConfig, TrendConfig
 from market_data import MarketState
 from models import Regime, Side, Signal, StrategyName
 
@@ -54,6 +54,10 @@ class PairAnalytics:
     projected_move_pct: float = float("nan")
     fee_ok: bool = False
     fee_reason: str = "warmup"
+    trend_entry_level: float = float("nan")    # máximo de N velas 6 h (ruptura)
+    trend_ema: float = float("nan")            # EMA 200 en 6 h
+    trend_exit_level: float = float("nan")     # mínimo de M velas 6 h (salida de canal)
+    trend_atr: float = float("nan")            # ATR(14) en 6 h
     signal_state: str = "WARMUP"
     ts: float = field(default_factory=time.time)
 
@@ -127,6 +131,60 @@ class RegimeDetector:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Seguimiento de tendencia 6 h
+# ─────────────────────────────────────────────────────────────────────────────
+@dataclass
+class TrendState:
+    ready: bool = False
+    bar_start: float = 0.0          # inicio de la última vela 6 h CERRADA evaluada
+    bar_close_ts: float = 0.0
+    close: float = float("nan")
+    entry_level: float = float("nan")
+    exit_level: float = float("nan")
+    ema: float = float("nan")
+    atr: float = float("nan")
+    breakout: bool = False
+    channel_exit: bool = False
+
+
+class TrendStrategy:
+    """Mismas reglas que research_trend.simulate (validado fuera de muestra)."""
+
+    def __init__(self, cfg: TrendConfig) -> None:
+        self.cfg = cfg
+        self.state: dict[str, TrendState] = {}
+
+    @staticmethod
+    def compute(s: dict[str, np.ndarray], cfg: TrendConfig) -> TrendState:
+        c, h, l = s["close"], s["high"], s["low"]
+        st = TrendState()
+        need = max(cfg.ema_period, cfg.n_entry, cfg.n_exit) + 2
+        if len(c) < need:
+            return st
+        st.ready = True
+        st.bar_start = float(s["start"][-1])
+        st.bar_close_ts = st.bar_start + cfg.tf_seconds
+        st.close = float(c[-1])
+        st.entry_level = float(np.max(h[-cfg.n_entry - 1:-1]))
+        st.exit_level = float(np.min(l[-cfg.n_exit - 1:-1]))
+        st.ema = float(ind.ema(c, cfg.ema_period)[-1])
+        st.atr = float(ind.atr(h, l, c, cfg.atr_period)[-1])
+        st.breakout = st.close > st.entry_level and st.close > st.ema
+        st.channel_exit = st.close < st.exit_level
+        return st
+
+    def update(self, mk: MarketState) -> tuple[TrendState, bool]:
+        """Recalcula sólo al cerrar una vela 6 h. Devuelve (estado, ¿vela nueva?)."""
+        prev = self.state.get(mk.product_id)
+        s = mk.htf.closed()
+        if not len(s["start"]) or (prev is not None and prev.bar_start == s["start"][-1]):
+            return prev or TrendState(), False
+        st = self.compute(s, self.cfg)
+        self.state[mk.product_id] = st
+        return st, prev is not None and st.ready
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Oráculo BTC (Market Leader Veto)
 # ─────────────────────────────────────────────────────────────────────────────
 @dataclass
@@ -183,8 +241,12 @@ class BTCOracle:
 # ─────────────────────────────────────────────────────────────────────────────
 class StrategyEngine:
     def __init__(
-        self, scfg: StrategyConfig, fcfg: FeeConfig, ocfg: OracleConfig, pairs: dict[str, PairConfig]
+        self, scfg: StrategyConfig, fcfg: FeeConfig, ocfg: OracleConfig, pairs: dict[str, PairConfig],
+        tcfg: TrendConfig | None = None, strategies: tuple[str, ...] = ("BREAKOUT_ORDERFLOW", "MEAN_REVERSION_MICRO"),
     ) -> None:
+        self.tcfg = tcfg or TrendConfig()
+        self.trend = TrendStrategy(self.tcfg)
+        self.strategies = set(strategies)
         self.cfg = scfg
         self.fees = fcfg
         self.pairs = pairs
@@ -294,6 +356,48 @@ class StrategyEngine:
 
         a.signal_state = f"SEÑAL {signal.strategy.value}"
         return a, signal
+
+    # ── Estrategia de tendencia 6 h ─────────────────────────────────────────
+    def evaluate_trend(self, mk: MarketState) -> tuple[PairAnalytics, Signal | None, TrendState]:
+        a, _, _ = self.analyze(mk)
+        pcfg = self.pairs[mk.product_id]
+        st, new_bar = self.trend.update(mk)
+        a.trend_entry_level, a.trend_ema, a.trend_exit_level, a.trend_atr = (
+            st.entry_level, st.ema, st.exit_level, st.atr)
+        a.fee_ok, a.fee_reason = True, "N/A (tendencia sin TP fijo)"
+        if not st.ready:
+            a.signal_state = "TREND_6H: calentando (faltan velas 6 h)"
+            return a, None, st
+        dist = (st.entry_level - a.price) / a.price * 100 if a.price else float("nan")
+        a.projected_move_pct = dist
+        base = (f"TREND_6H: cierre {st.close:.6g} · ruptura {st.entry_level:.6g} · EMA200 {st.ema:.6g}")
+        if not st.breakout:
+            why = "bajo EMA200" if st.close <= st.ema else f"falta {dist:+.2f}% para la ruptura"
+            a.signal_state = f"{base} · sin señal ({why})"
+            return a, None, st
+        if time.time() - st.bar_close_ts > self.tcfg.entry_window_s:
+            a.signal_state = f"{base} · ruptura en la vela anterior (ventana de entrada expirada)"
+            return a, None, st
+        if not mk.is_ready or math.isnan(a.spread_pct) or a.spread_pct > pcfg.max_spread_pct:
+            a.signal_state = f"{base} · ruptura bloqueada por spread"
+            return a, None, st
+        if a.obi < self.cfg.obi_min_long:
+            a.signal_state = f"{base} · ruptura bloqueada por OBI {a.obi:+.2f}"
+            return a, None, st
+        if mk.product_id != ORACLE_PRODUCT and self.oracle.state.veto:
+            a.signal_state = f"{base} · ruptura bloqueada por el oráculo BTC"
+            return a, None, st
+        price = a.best_bid if not math.isnan(a.best_bid) else a.price
+        sig = Signal(
+            product_id=mk.product_id, strategy=StrategyName.TREND, side=Side.BUY, regime=Regime.TREND,
+            ref_price=price, stop_price=price - self.tcfg.k_atr * st.atr,
+            take_profit=price * self.tcfg.far_tp_multiple, atr=st.atr, obi=a.obi,
+            projected_move_pct=float("nan"),
+            reason=f"Ruptura Donchian {self.tcfg.n_entry}×6h ({st.close:.6g} > {st.entry_level:.6g}) sobre EMA200",
+        )
+        sig.ts = st.bar_close_ts
+        a.signal_state = f"SEÑAL TREND_6H · {base}"
+        return a, sig, st
 
     # ── Estrategia 1: Breakout + Order Flow ─────────────────────────────────
     def _breakout(self, mk: MarketState, a: PairAnalytics, s5: dict[str, np.ndarray]) -> Signal | None:

@@ -166,6 +166,10 @@ class Database:
         for col in ("initial_stop", "take_profit"):
             if col not in cols:
                 self._conn.execute(f"ALTER TABLE trades ADD COLUMN {col} REAL")
+        pcols = {r[1] for r in self._conn.execute("PRAGMA table_info(pair_snapshot)").fetchall()}
+        for col in ("trend_entry_level", "trend_ema", "trend_exit_level", "trend_atr"):
+            if col not in pcols:
+                self._conn.execute(f"ALTER TABLE pair_snapshot ADD COLUMN {col} REAL")
         self._conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_product ON trades(product_id, closed_at)")
 
     # ── utilidades básicas ──────────────────────────────────────────────────

@@ -115,6 +115,18 @@ Transfer). Para `TELEGRAM_CHAT_ID` habla con tu bot y consulta `getUpdates`.
 
 ## 5. Lógica clave
 
+> **Estrategia activa por defecto: `TREND_6H`** (seguimiento de tendencia en velas de 6 h), elegida tras
+> el backtest documentado en [`docs/BACKTEST.md`](docs/BACKTEST.md): las estrategias intradía de abajo
+> no superan las comisiones de Coinbase. Siguen disponibles con `STRATEGIES=BREAKOUT_ORDERFLOW,MEAN_REVERSION_MICRO`.
+>
+> **TREND_6H:** entrada LONG cuando una vela de 6 h cierra por encima del máximo de las 20 anteriores y
+> de la EMA 200; stop inicial y trailing a 5·ATR(14, 6 h) desde el máximo; salida también si una vela
+> de 6 h cierra bajo el mínimo de las 20 anteriores. Sin TP fijo. Ejecución maker con chasing, filtros
+> de spread, OBI y Oráculo BTC en la entrada, 1 % de riesgo por operación, máx. 2 posiciones. El stop
+> reside también en Coinbase (orden bracket) por si el motor cae.
+
+### Estrategias intradía originales (desactivadas por defecto)
+
 **Régimen (barras 5m):** `Hurst ≥ 0.55 ∧ ADX ≥ 25 → TREND`; `Hurst ≤ 0.45 ∧ ADX ≤ 20 → RANGE`;
 percentil de ATR% ≥ 97 o ≤ 3, o cualquier zona intermedia → `NOISE` (bloqueo).
 

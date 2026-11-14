@@ -37,7 +37,7 @@ from database import AsyncDatabase
 from exchange import CoinbaseGateway, Gateway, PaperGateway, map_status
 from execution_handler import ExecutionHandler
 from market_data import MarketState, SequenceTracker, parse_ts
-from models import BotStatus, CommandType, OrderUpdate, Regime, Side, Signal
+from models import BotStatus, CommandType, OrderUpdate, Regime, Side, Signal, StrategyName
 from risk_manager import RiskManager, RiskState
 from strategy_engine import StrategyEngine
 from telegram_bot import TelegramNotifier
@@ -71,7 +71,11 @@ class TradingEngine:
         self.markets: dict[str, MarketState] = {
             pid: MarketState(pid, max_bars=required_history_1m(settings.strategy)) for pid in settings.pairs
         }
-        self.strategy = StrategyEngine(settings.strategy, settings.fees, settings.oracle, settings.pairs)
+        self.strategy = StrategyEngine(settings.strategy, settings.fees, settings.oracle, settings.pairs,
+                                       settings.trend, settings.strategies)
+        self.trend_enabled = StrategyName.TREND.value in settings.strategies
+        self.micro_enabled = any(x in settings.strategies for x in
+                                 (StrategyName.BREAKOUT.value, StrategyName.MEAN_REVERSION.value))
         self.risk = RiskManager(settings.risk, settings.pairs, settings.execution.min_net_rr)
         self.notifier = TelegramNotifier(settings.creds.telegram_token, settings.creds.telegram_chat_id)
         self.cb_key, self.cb_secret, self.creds_source = self._resolve_coinbase_creds()
@@ -223,6 +227,8 @@ class TradingEngine:
     async def _seed_history(self) -> None:
         minutes = required_history_1m(self.s.strategy)
 
+        tc = self.s.trend
+
         async def seed(pid: str) -> None:
             try:
                 candles = await self.gateway.get_candles(pid, minutes)
@@ -230,6 +236,13 @@ class TradingEngine:
                 log.info("Historia %s: %d velas 1m", pid, len(self.markets[pid].bars))
             except Exception as exc:  # noqa: BLE001
                 log.error("Sin historia para %s: %s (calentamiento en vivo)", pid, exc)
+            try:
+                htf = await self.gateway.get_candles(pid, tc.history_bars * tc.tf_seconds // 60,
+                                                     tc.granularity, tc.tf_seconds)
+                self.markets[pid].htf.seed(htf)
+                log.info("Historia %s: %d velas 6h", pid, len(self.markets[pid].htf.bars))
+            except Exception as exc:  # noqa: BLE001
+                log.error("Sin velas 6h para %s: %s", pid, exc)
 
         for p in self.s.pairs:   # secuencial: evita 429 en la API pública de Coinbase
             await seed(p)
@@ -482,10 +495,14 @@ class TradingEngine:
         """Revalidación ligera usada por el Smart Order Chasing."""
         a = self.strategy.analytics[sig.product_id]
         pcfg = self.s.pairs[sig.product_id]
-        if time.time() - sig.ts > 120:
-            return False, "señal caducada (>120s)"
-        if a.regime is not sig.regime:
-            return False, f"régimen cambió a {a.regime.value}"
+        if sig.strategy is StrategyName.TREND:
+            if time.time() - sig.ts > self.s.trend.entry_window_s:
+                return False, "ventana de entrada de la vela 6h expirada"
+        else:
+            if time.time() - sig.ts > 120:
+                return False, "señal caducada (>120s)"
+            if a.regime is not sig.regime:
+                return False, f"régimen cambió a {a.regime.value}"
         mk = self.markets[sig.product_id]
         obi = mk.book.obi_band(self.s.strategy.obi_band_bps, self.s.strategy.obi_levels)
         if obi < self.s.strategy.obi_min_long:
@@ -509,7 +526,16 @@ class TradingEngine:
                     await self._event("WARN" if st.veto else "INFO", "ORACLE", st.reason)
             trades_hist: list[dict[str, Any]] | None = None
             for pid, mk in self.markets.items():
-                analytics, sig = self.strategy.evaluate(mk)
+                sig = None
+                if self.trend_enabled:
+                    analytics, sig, tstate = self.strategy.evaluate_trend(mk)
+                    await self._check_channel_exit(pid, tstate)
+                if sig is None and self.micro_enabled:
+                    analytics, sig = self.strategy.evaluate(mk)
+                    if sig is not None and sig.strategy.value not in self.s.strategies:
+                        sig = None
+                elif not self.trend_enabled:
+                    analytics, sig = self.strategy.evaluate(mk)
                 if sig is None:
                     continue
                 ok, why = self.risk.can_open(pid, self.execution.open_products, self.execution.pending_products)
@@ -536,6 +562,16 @@ class TradingEngine:
                 self.execution.submit_entry(sig, sizing)
             elapsed = time.perf_counter() - t0
             await asyncio.sleep(max(interval - elapsed, 0.05))
+
+    async def _check_channel_exit(self, pid: str, st: Any) -> None:
+        """Salida de tendencia: cierre de vela 6 h por debajo del mínimo de M velas."""
+        if not getattr(st, "ready", False) or not st.channel_exit:
+            return
+        for pos in list(self.execution.positions.values()):
+            if (pos.product_id == pid and pos.strategy is StrategyName.TREND and not pos.closing
+                    and st.bar_close_ts > pos.opened_at):
+                await self._event("INFO", "EXIT", f"{pid}: cierre 6h {st.close:.6g} < canal {st.exit_level:.6g}")
+                asyncio.create_task(self.execution.close_position(pos.position_id, "SALIDA DE CANAL 6H"))
 
     def _free_quote(self) -> float:
         cash = self.balances.get("USDC", 0.0)
@@ -791,6 +827,8 @@ class TradingEngine:
                 "adx": _nn(a.adx), "vwap": _nn(a.vwap), "cvd_5m": _nn(a.cvd_5m),
                 "projected_move_pct": _nn(a.projected_move_pct), "fee_filter_ok": int(a.fee_ok),
                 "fee_filter_reason": a.fee_reason, "signal": a.signal_state, "updated_at": a.ts,
+                "trend_entry_level": _nn(a.trend_entry_level), "trend_ema": _nn(a.trend_ema),
+                "trend_exit_level": _nn(a.trend_exit_level), "trend_atr": _nn(a.trend_atr),
             })
         o = self.strategy.oracle.state
         connected, hb_age = self._market_conns_ok()
@@ -815,7 +853,9 @@ class TradingEngine:
             "open_positions": len(self.execution.positions),
             "max_open_positions": self.s.risk.max_open_positions,
             "credentials_source": self.creds_source,
-            "signal_tf_minutes": self.s.strategy.regime_tf_minutes,
+            "signal_tf_minutes": (self.s.trend.tf_seconds // 60) if self.trend_enabled
+                                 else self.s.strategy.regime_tf_minutes,
+            "strategies": list(self.s.strategies),
             "live_allowed": self.s.runtime.allow_live,
             "universe": list(self.s.pairs),
         }

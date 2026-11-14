@@ -359,6 +359,9 @@ class ExecutionHandler:
                      f"{pos.product_id} BUY {pos.size} @ {pos.entry_price:.6g} ({signal.strategy.value})")
 
     def _build_tp_levels(self, pos: Position, mk: MarketState) -> list[TPLevel]:
+        if pos.strategy is StrategyName.TREND:
+            # Sin TP: un único bracket con límite muy lejano aloja el stop en el exchange.
+            return [TPLevel(price=pos.take_profit, fraction=1.0)]
         meta = self.gw.meta(pos.product_id)
         prices = self.strategy.liquidity_tp_levels(mk, pos.entry_price, pos.r_value)
         fracs = list(self.s.strategy.partial_tp_fractions)
@@ -504,6 +507,22 @@ class ExecutionHandler:
                 continue
             pos.highest_price = max(pos.highest_price, bid)
             changed = False
+            if pos.strategy is StrategyName.TREND:
+                # Tendencia: trailing k·ATR(6h) desde el máximo, sin breakeven (igual que el backtest)
+                st = self.strategy.trend.state.get(pos.product_id)
+                atr6 = st.atr if st is not None and st.ready else pos.atr_at_entry
+                trail = pos.highest_price - self.s.trend.k_atr * atr6
+                if trail > pos.stop_price:
+                    pos.stop_price = trail
+                    changed = True
+                if bid <= pos.stop_price:
+                    asyncio.create_task(self.close_position(
+                        pos.position_id, "TRAILING STOP" if pos.stop_price > pos.entry_price else "STOP LOSS"))
+                    continue
+                if changed:
+                    await self._persist_position(pos)
+                self._schedule_exchange_stop_update(pos)
+                continue
             # 2) Fee-Adjusted Breakeven a +1.2R
             if not pos.breakeven_armed and pos.r_multiple(bid) >= be_trigger:
                 be = fee_adjusted_breakeven(pos.entry_price, pos.entry_fee_rate, self.strategy.taker_fee)

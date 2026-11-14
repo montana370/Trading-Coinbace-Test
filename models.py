@@ -30,6 +30,7 @@ class Side(str, Enum):
 class StrategyName(str, Enum):
     BREAKOUT = "BREAKOUT_ORDERFLOW"
     MEAN_REVERSION = "MEAN_REVERSION_MICRO"
+    TREND = "TREND_6H"
 
 
 class CommandType(str, Enum):
