@@ -278,13 +278,21 @@ async def _fetch_candles(
     cursor_end = end
     while cursor_end > start_limit:
         chunk_start = max(cursor_end - timedelta(minutes=300), start_limit)
-        resp = await caller(
-            fn, product_id=product_id,
-            start=str(int(chunk_start.timestamp())), end=str(int(cursor_end.timestamp())),
-            granularity="ONE_MINUTE",
-        )
+        for attempt in range(6):
+            try:
+                resp = await caller(
+                    fn, product_id=product_id,
+                    start=str(int(chunk_start.timestamp())), end=str(int(cursor_end.timestamp())),
+                    granularity="ONE_MINUTE",
+                )
+                break
+            except Exception as exc:  # noqa: BLE001
+                if "429" not in str(exc) or attempt == 5:
+                    raise
+                await asyncio.sleep(1.5 * (2 ** attempt))   # rate limit: backoff exponencial
         out.extend(to_dict(c) for c in resp.get("candles", []))
         cursor_end = chunk_start
+        await asyncio.sleep(0.35)   # < 3 req/s: bajo el límite de endpoints públicos
     return out
 
 

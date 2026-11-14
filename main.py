@@ -206,7 +206,8 @@ class TradingEngine:
             except Exception as exc:  # noqa: BLE001
                 log.error("Sin historia para %s: %s (calentamiento en vivo)", pid, exc)
 
-        await asyncio.gather(*(seed(p) for p in self.s.pairs))
+        for p in self.s.pairs:   # secuencial: evita 429 en la API pública de Coinbase
+            await seed(p)
 
     # ═════════════════════════════════════════════════════════════════════
     # WebSockets (hilo del SDK → event loop del motor)
