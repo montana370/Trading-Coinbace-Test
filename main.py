@@ -59,6 +59,9 @@ class WSConn:
     seq: SequenceTracker = field(default_factory=SequenceTracker)
     resync_requested: bool = False
     reconnecting: bool = False
+    msg_counts: dict[str, int] = field(default_factory=dict)
+    opens: int = 0
+    closes: int = 0
 
 
 class TradingEngine:
@@ -147,6 +150,7 @@ class TradingEngine:
             asyncio.create_task(self.watchdog_loop(), name="watchdog_loop"),
             asyncio.create_task(self.reconcile_loop(), name="reconcile_loop"),
             asyncio.create_task(self.ws_supervisor(), name="ws_supervisor"),
+            asyncio.create_task(self.diag_loop(), name="diag_loop"),
         ]
         for t in self.tasks:
             t.add_done_callback(self._task_done)
@@ -253,7 +257,11 @@ class TradingEngine:
         if c:
             c.connected = connected
             if connected:
+                c.opens += 1
                 c.seq.reset()
+            else:
+                c.closes += 1
+                log.warning("WS %s cerrado (cierres=%d)", name, c.closes)
 
     def _open_conn(self, conn: WSConn) -> None:
         """Bloqueante (se llama vía to_thread o en arranque)."""
@@ -309,6 +317,21 @@ class TradingEngine:
         finally:
             conn.reconnecting = False
 
+    async def diag_loop(self) -> None:
+        """Diagnóstico periódico de la ingesta (visible en los logs de Railway)."""
+        while not self.stop_event.is_set():
+            await asyncio.sleep(30.0)
+            conns = " | ".join(
+                f"{c.name}:{'up' if c.connected else 'DOWN'} open={c.opens} close={c.closes} {c.msg_counts}"
+                for c in self.conns.values()
+            )
+            books = " ".join(
+                f"{pid.split('-')[0]}={'OK' if mk.book.initialized else 'NO'}"
+                f"({len(mk.book.bids)}/{len(mk.book.asks)}) tr={len(mk.trades)}"
+                for pid, mk in self.markets.items()
+            )
+            log.info("[DIAG] %s || %s", conns, books)
+
     async def ws_supervisor(self) -> None:
         while not self.stop_event.is_set():
             await asyncio.sleep(2.0)
@@ -330,6 +353,10 @@ class TradingEngine:
             if conn is None:
                 continue
             conn.last_msg = recv
+            key = str(msg.get("channel") or msg.get("type") or "?")
+            if key not in conn.msg_counts:
+                log.info("WS %s primer mensaje de '%s': %s", name, key, json.dumps(msg)[:400])
+            conn.msg_counts[key] = conn.msg_counts.get(key, 0) + 1
             if not conn.seq.check(msg.get("sequence_num")):
                 if "level2" in conn.channels:
                     conn.resync_requested = True
@@ -350,8 +377,8 @@ class TradingEngine:
                     conn.last_heartbeat = recv
                 elif channel == "user":
                     await self._on_user(msg)
-                elif msg.get("type") == "error":
-                    log.error("WS %s error: %s", name, msg.get("message"))
+                elif msg.get("type") == "error" or channel == "error":
+                    log.error("WS %s error: %s", name, json.dumps(msg)[:500])
             except Exception:  # noqa: BLE001
                 log.exception("Error procesando mensaje %s", channel)
 
