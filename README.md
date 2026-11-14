@@ -153,3 +153,19 @@ seguidas ⇒ pausa 6 h · heartbeat > 5 s, WS caído o latencia REST > 500 ms (3
 - La validación en vivo contra Coinbase no se ha podido ejecutar en el entorno de desarrollo (red
   restringida); el motor completo se ha verificado con mensajes WebSocket sintéticos con el formato real
   (`tests/test_engine_offline.py`) y el ciclo de vida de órdenes con el simulador PAPER.
+
+## 7. Despliegue en Railway
+
+Un único servicio (Dockerfile) ejecuta `start.sh`, que lanza **Core Engine + Dashboard** en el mismo
+contenedor para que compartan el volumen SQLite montado en `/data`. Si uno de los dos procesos muere, el
+contenedor sale y Railway lo reinicia (política `ALWAYS`).
+
+Variables en Railway → *Variables*:
+
+| Variable | Obligatoria | Notas |
+|---|---|---|
+| `DASHBOARD_PASSWORD` | sí | el dashboard es público y tiene Kill-Switch; sin ella el contenedor no arranca |
+| `DB_PATH` | — | por defecto `/data/trading_state.db` (volumen) |
+| `TRADING_MODE` / `ALLOW_LIVE_TRADING` | — | `PAPER` / `false` por defecto |
+| `COINBASE_API_KEY` / `COINBASE_API_SECRET` | para LIVE | pegar la clave PEM con `\n` literales |
+| `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | opcional | alertas y comandos |

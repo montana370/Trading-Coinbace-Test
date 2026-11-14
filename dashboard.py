@@ -10,7 +10,9 @@ Uso:  streamlit run dashboard.py
 """
 from __future__ import annotations
 
+import hmac
 import math
+import os
 import time
 from datetime import datetime, timezone
 from typing import Any
@@ -25,6 +27,25 @@ from database import Database
 REFRESH_S = 1.0
 
 st.set_page_config(page_title="Quant Terminal · Coinbase", page_icon="📈", layout="wide")
+
+
+def require_auth() -> None:
+    """Puerta de acceso: obligatoria si DASHBOARD_PASSWORD está definida (siempre en Railway)."""
+    expected = os.getenv("DASHBOARD_PASSWORD", "")
+    if not expected or st.session_state.get("auth_ok"):
+        return
+    st.title("🔒 Quant Terminal")
+    entered = st.text_input("Contraseña del dashboard", type="password")
+    if entered:
+        if hmac.compare_digest(entered.encode(), expected.encode()):
+            st.session_state["auth_ok"] = True
+            st.rerun()
+        time.sleep(1.0)  # frena fuerza bruta
+        st.error("Contraseña incorrecta")
+    st.stop()
+
+
+require_auth()
 
 st.markdown(
     """

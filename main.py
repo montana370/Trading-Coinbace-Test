@@ -167,7 +167,16 @@ class TradingEngine:
             self.tasks.append(new)
 
     async def _load_market_metadata(self) -> None:
-        metas = await self.gateway.load_products(list(self.s.pairs))
+        for attempt in range(1, 11):
+            try:
+                metas = await self.gateway.load_products(list(self.s.pairs))
+                break
+            except Exception as exc:  # noqa: BLE001
+                if attempt == 10:
+                    raise
+                wait = min(2 ** attempt, 60)
+                log.error("load_products falló (%d/10): %s — reintento en %ds", attempt, exc, wait)
+                await asyncio.sleep(wait)
         for pid, m in metas.items():
             mk = self.markets[pid]
             mk.base_increment = m.base_increment
