@@ -81,7 +81,9 @@ async def test_engine_end_to_end_offline(tmp_path, monkeypatch):
         for i in range(25):
             ups.append({"side": "bid", "price_level": f"{px - (i + 1) * tick:.4f}", "new_quantity": "8"})
             ups.append({"side": "offer", "price_level": f"{px + (i + 1) * tick:.4f}", "new_quantity": "2"})
-        push("l2", {"channel": "l2_data", "events": [{"type": "snapshot", "product_id": pid, "updates": ups}]})
+        # Coinbase envía los pares USDC con el alias USD (liquidez unificada)
+        push("l2", {"channel": "l2_data", "events": [{"type": "snapshot", "product_id": pid.replace("USDC", "USD"),
+                                                     "updates": ups}]})
 
     # BTC: flujo vendedor agresivo + caída → debe activar el veto del oráculo
     for k in range(40):
@@ -90,10 +92,10 @@ async def test_engine_end_to_end_offline(tmp_path, monkeypatch):
         for pid, px in PRICES.items():
             if pid == "BTC-USDC":
                 p = px * (1 - 0.0002 * k)
-                trades.append({"trade_id": str(k), "product_id": pid, "price": f"{p:.2f}", "size": "0.5",
+                trades.append({"trade_id": str(k), "product_id": pid.replace("USDC", "USD"), "price": f"{p:.2f}", "size": "0.5",
                                "side": "SELL", "time": _iso(ts)})
             else:
-                trades.append({"trade_id": str(k), "product_id": pid, "price": f"{px:.4f}", "size": "1",
+                trades.append({"trade_id": str(k), "product_id": pid.replace("USDC", "USD"), "price": f"{px:.4f}", "size": "1",
                                "side": "BUY", "time": _iso(ts)})
         push("flow", {"channel": "market_trades", "events": [{"type": "update", "trades": trades}]})
     push("l2", {"channel": "heartbeats", "events": [{"heartbeat_counter": 1}]})

@@ -382,9 +382,19 @@ class TradingEngine:
             except Exception:  # noqa: BLE001
                 log.exception("Error procesando mensaje %s", channel)
 
+    def _market(self, product_id: str) -> MarketState | None:
+        """
+        Coinbase unifica la liquidez USD/USDC: aunque nos suscribamos a X-USDC,
+        los mensajes WebSocket llegan como X-USD. Se resuelven ambos alias.
+        """
+        mk = self.markets.get(product_id)
+        if mk is None and product_id.endswith("-USD"):
+            mk = self.markets.get(product_id + "C")
+        return mk
+
     def _on_l2(self, msg: dict[str, Any]) -> None:
         for ev in msg.get("events", []):
-            mk = self.markets.get(ev.get("product_id", ""))
+            mk = self._market(ev.get("product_id", ""))
             if mk is None:
                 continue
             if ev.get("type") == "snapshot":
@@ -398,7 +408,7 @@ class TradingEngine:
             is_update = ev.get("type") == "update"
             trades = sorted(ev.get("trades", []), key=lambda t: parse_ts(t.get("time")))
             for tr in trades:
-                mk = self.markets.get(tr.get("product_id", ""))
+                mk = self._market(tr.get("product_id", ""))
                 if mk is None:
                     continue
                 price, size = float(tr["price"]), float(tr["size"])
@@ -413,7 +423,7 @@ class TradingEngine:
     def _on_ticker(self, msg: dict[str, Any]) -> None:
         for ev in msg.get("events", []):
             for tk in ev.get("tickers", []):
-                mk = self.markets.get(tk.get("product_id", ""))
+                mk = self._market(tk.get("product_id", ""))
                 if mk is None:
                     continue
                 mk.ticker_ts = time.time()
@@ -425,13 +435,14 @@ class TradingEngine:
     async def _on_user(self, msg: dict[str, Any]) -> None:
         for ev in msg.get("events", []):
             for o in ev.get("orders", []):
-                if o.get("product_id") not in self.markets:
+                mk = self._market(o.get("product_id", ""))
+                if mk is None:
                     continue
                 cum = float(o.get("cumulative_quantity") or 0.0)
                 upd = OrderUpdate(
                     order_id=o.get("order_id", ""),
                     client_order_id=o.get("client_order_id", ""),
-                    product_id=o["product_id"],
+                    product_id=mk.product_id,
                     side=Side(o.get("order_side", "BUY").upper()),
                     status=map_status(o.get("status", "")),
                     filled_size=cum,
