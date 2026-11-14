@@ -56,6 +56,7 @@ class TrackedOrder:
     avg_price: float = 0.0
     fees: float = 0.0
     created_at: float = field(default_factory=time.time)
+    stop_trigger: float = 0.0
     event: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
 
     def row(self, mode: str) -> dict[str, Any]:
@@ -114,6 +115,9 @@ class ExecutionHandler:
         self._close_locks: dict[str, asyncio.Lock] = {}
         self.gw.on_order_update = self.on_order_update
         self.closed_trades_cache: list[dict[str, Any]] = []
+        self._exchange_stop_at: dict[str, float] = {}           # position_id → stop colocado
+        self._exchange_stop_ts: dict[str, float] = {}
+        self._stop_update_tasks: dict[str, asyncio.Task[None]] = {}
 
     # ═════════════════════════════════════════════════════════════════════
     # Registro de órdenes / eventos
@@ -397,14 +401,19 @@ class ExecutionHandler:
             bid = mk.book.best_bid
             if bid is not None and px <= bid:  # ya alcanzado: un tick sobre el bid
                 px = bid + meta.quote_increment
+            use_bracket = self.s.execution.exchange_stops
+            trigger = self.exchange_stop_price(pos) if use_bracket else 0.0
             t = TrackedOrder(
                 client_order_id=new_client_order_id(self.s.execution.order_prefix, "tp"),
                 product_id=pos.product_id, side=Side.SELL, purpose="TAKE_PROFIT",
-                price=px, size=qty, position_id=pos.position_id,
+                price=px, size=qty, position_id=pos.position_id, stop_trigger=trigger,
             )
             self._track(t)
             try:
-                oid = await self.gw.place_post_only(pos.product_id, Side.SELL, qty, px, t.client_order_id)
+                if use_bracket:
+                    oid = await self.gw.place_bracket_sell(pos.product_id, qty, px, trigger, t.client_order_id)
+                else:
+                    oid = await self.gw.place_post_only(pos.product_id, Side.SELL, qty, px, t.client_order_id)
             except PostOnlyRejected:
                 t.status = OrderStatus.REJECTED
                 continue
@@ -415,6 +424,52 @@ class ExecutionHandler:
             self._bind(t, oid)
             lv.order_id, lv.client_order_id = oid, t.client_order_id
             remaining -= qty
+        if self.s.execution.exchange_stops:
+            self._exchange_stop_at[pos.position_id] = self.exchange_stop_price(pos)
+            self._exchange_stop_ts[pos.position_id] = time.time()
+
+    def exchange_stop_price(self, pos: Position) -> float:
+        """Stop de respaldo en el exchange: ligeramente por debajo del stop software."""
+        meta = self.gw.meta(pos.product_id)
+        return round_step(pos.stop_price * (1 - self.s.execution.exchange_stop_buffer_pct / 100), meta.quote_increment)
+
+    def _schedule_exchange_stop_update(self, pos: Position) -> None:
+        if not self.s.execution.exchange_stops or pos.closing:
+            return
+        placed = self._exchange_stop_at.get(pos.position_id, 0.0)
+        target = self.exchange_stop_price(pos)
+        # sólo si el stop sube de forma significativa (≥ 0.25 ATR) y con control de frecuencia
+        min_step = 0.25 * (pos.atr_at_entry or 0.0)
+        if target <= placed + min_step and not (pos.breakeven_armed and placed < pos.entry_price):
+            return
+        if time.time() - self._exchange_stop_ts.get(pos.position_id, 0.0) < self.s.execution.exchange_stop_min_update_s:
+            return
+        task = self._stop_update_tasks.get(pos.position_id)
+        if task and not task.done():
+            return
+        self._stop_update_tasks[pos.position_id] = asyncio.create_task(self._replace_brackets(pos.position_id))
+
+    async def _replace_brackets(self, position_id: str) -> None:
+        """Cancela y recoloca los brackets con el stop actualizado (no son editables en Coinbase)."""
+        pos = self.positions.get(position_id)
+        if pos is None:
+            return
+        lock = self._close_locks.setdefault(position_id, asyncio.Lock())
+        async with lock:
+            if pos.closing or position_id not in self.positions:
+                return
+            self._exchange_stop_ts[position_id] = time.time()
+            active = [t for t in self.orders_by_cid.values()
+                      if t.position_id == position_id and t.purpose == "TAKE_PROFIT" and not t.status.is_terminal]
+            await asyncio.gather(*(self._cancel_and_settle(t) for t in active))
+            if pos.closing or position_id not in self.positions or pos.size <= 0:
+                return
+            for lv in pos.tp_levels:
+                if not lv.filled:
+                    lv.order_id = None
+            await self._place_tp_orders(pos)
+            await self._persist_position(pos)
+            log.info("[%s] stop en exchange actualizado → %.6g", pos.product_id, self._exchange_stop_at.get(position_id, 0))
 
     async def _on_tp_fill(self, t: TrackedOrder, qty: float, fee: float) -> None:
         pos = self.positions.get(t.position_id or "")
@@ -431,7 +486,8 @@ class ExecutionHandler:
         if t.status is OrderStatus.FILLED:
             self.notifier.notify_partial_tp(pos, px, qty, fee, self.mode)
         if pos.size < meta.base_min_size and not pos.closing:
-            await self._finalize(pos, exit_price=px, reason="TAKE PROFIT")
+            reason = "STOP EN EXCHANGE" if t.stop_trigger and px <= t.stop_trigger * 1.01 else "TAKE PROFIT"
+            await self._finalize(pos, exit_price=px, reason=reason)
         else:
             await self._persist_position(pos)
 
@@ -473,6 +529,7 @@ class ExecutionHandler:
                 continue
             if changed:
                 await self._persist_position(pos)
+            self._schedule_exchange_stop_update(pos)
 
     async def close_position(self, position_id: str, reason: str) -> None:
         pos = self.positions.get(position_id)

@@ -25,6 +25,7 @@ function cls(v) { return v == null ? "" : v > 0 ? "up" : v < 0 ? "down" : ""; }
 function ago(ts) { if (!ts) return "—"; const s = Math.max(0, Date.now() / 1000 - ts); if (s < 60) return `${s | 0}s`; if (s < 3600) return `${(s / 60) | 0}m`; if (s < 86400) return `${(s / 3600) | 0}h`; return `${(s / 86400) | 0}d`; }
 function dt(ts) { return ts ? new Date(ts * 1000).toLocaleString("es-ES", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" }) : "—"; }
 function dur(s) { s = s | 0; const h = (s / 3600) | 0, m = ((s % 3600) / 60) | 0; return h ? `${h}h ${m}m` : `${m}m ${s % 60}s`; }
+function tfLabel() { const m = (S.data && S.data.telemetry && S.data.telemetry.signal_tf_minutes) || 5; return m >= 60 ? `${m / 60}h` : `${m}m`; }
 function css(name) { return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
 function coin(pid, small) { const b = base(pid); const k = ["SOL", "BTC", "ETH", "SUI"].includes(b) ? b : "default"; return `<div class="coin coin-${k}"${small ? "" : ""}>${esc(b.slice(0, 3))}</div>`; }
 function regimePill(r) { const m = { TREND: "pill-accent", RANGE: "pill-violet", NOISE: "pill-down", WARMUP: "" }; return `<span class="pill ${m[r] || ""}">${esc(r || "—")}</span>`; }
@@ -286,7 +287,7 @@ function renderAssetDetail(p) {
   $("#a-metrics").innerHTML = `
     <div class="kv"><span>Spread / máx</span><span class="${sp != null && sp <= p.max_spread_pct ? "up" : "down"}">${sp != null ? sp.toFixed(3) : "—"}% / ${p.max_spread_pct}%</span></div>
     <div class="kv"><span>OBI L2 (±0.10%)</span><span>${fsign(p.obi)}</span></div><div style="padding:2px 0 8px">${obiBar(p.obi)}</div>
-    <div class="kv"><span>ATR (5m)</span><span>${fpx(pid, p.atr)} (${p.atr_pct != null ? p.atr_pct.toFixed(2) : "—"}%)</span></div>
+    <div class="kv"><span>ATR (${tfLabel()})</span><span>${fpx(pid, p.atr)} (${p.atr_pct != null ? p.atr_pct.toFixed(2) : "—"}%)</span></div>
     <div class="kv"><span>Hurst · ADX</span><span>${p.hurst != null ? p.hurst.toFixed(2) : "—"} · ${p.adx != null ? p.adx.toFixed(1) : "—"}</span></div>
     <div class="kv"><span>VWAP sesión</span><span>${fpx(pid, p.vwap)}</span></div>
     <div class="kv"><span>CVD 5m</span><span class="${cls(p.cvd_5m)}">${fsign(p.cvd_5m, 3)}</span></div>

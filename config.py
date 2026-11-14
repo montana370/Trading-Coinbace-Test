@@ -126,6 +126,12 @@ class ExecutionConfig:
     # En el canal market_trades de Coinbase, `side` indica el lado del agresor
     # (taker). Si tu verificación empírica indica lo contrario, pon False.
     trade_side_is_taker: bool = _env_bool("TRADE_SIDE_IS_TAKER", True)
+    # Stops de respaldo en el exchange: los TPs se envían como órdenes bracket
+    # (límite TP + disparo de stop). El stop del exchange queda un poco por
+    # debajo del stop software para actuar sólo si el motor no responde.
+    exchange_stops: bool = _env_bool("EXCHANGE_STOPS", True)
+    exchange_stop_buffer_pct: float = _env_float("EXCHANGE_STOP_BUFFER_PCT", 0.20)
+    exchange_stop_min_update_s: float = _env_float("EXCHANGE_STOP_MIN_UPDATE_S", 20.0)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -135,7 +141,7 @@ class ExecutionConfig:
 class StrategyConfig:
     bar_seconds: int = 60                    # barras base de 1 minuto
     regime_tf_minutes: int = 5               # régimen calculado en barras de 5m
-    history_bars_1m: int = 1500              # ~25 h de historia en memoria
+    history_bars_1m: int = 1500              # mínimo; se amplía según la TF de señal (ver required_history_1m)
     eval_interval_s: float = _env_float("EVAL_INTERVAL_S", 1.0)
 
     # Régimen
@@ -154,7 +160,8 @@ class StrategyConfig:
     bb_period: int = 20
     bb_std: float = 2.0
     kc_mult: float = 1.5
-    squeeze_lookback: int = 6                # barras de 5m desde la liberación
+    squeeze_lookback: int = 6                # barras de la TF de señal desde la liberación
+    breakout_require_squeeze: bool = True    # exigir liberación de squeeze (False = ruptura BB simple)
     volume_confirm_mult: float = 1.5
     cvd_window_s: int = 300
 
@@ -166,6 +173,7 @@ class StrategyConfig:
     absorption_window_s: int = 60
     absorption_sell_buy_ratio: float = 1.5
     absorption_max_range_atr: float = 0.35
+    mr_require_absorption: bool = True       # exigir absorción en el flujo de órdenes
 
     # OBI
     obi_levels: int = 10                     # mínimo de niveles por lado
@@ -181,6 +189,11 @@ class StrategyConfig:
     breakeven_trigger_r: float = 1.2
     partial_tp_fractions: tuple[float, ...] = (0.40, 0.30)   # resto → trailing
     partial_tp_r: tuple[float, ...] = (1.6, 2.6)
+
+
+def required_history_1m(c: "StrategyConfig") -> int:
+    """Velas de 1m necesarias para calentar Hurst + percentil de volatilidad en la TF de señal."""
+    return max(c.history_bars_1m, (c.hurst_window + c.vol_percentile_window + 40) * c.regime_tf_minutes)
 
 
 @dataclass(frozen=True)

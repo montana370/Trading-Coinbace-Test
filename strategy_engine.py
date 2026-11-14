@@ -18,6 +18,7 @@ from __future__ import annotations
 import math
 import time
 from dataclasses import dataclass, field
+from typing import Any
 
 import numpy as np
 
@@ -192,6 +193,7 @@ class StrategyEngine:
         self.maker_fee = fcfg.maker_fee
         self.taker_fee = fcfg.taker_fee
         self.analytics: dict[str, PairAnalytics] = {p: PairAnalytics(p) for p in pairs}
+        self._tf_cache: dict[str, tuple[Any, dict[str, np.ndarray], tuple[Regime, dict[str, float]]]] = {}
 
     def set_fee_rates(self, maker: float, taker: float) -> None:
         # Modelo conservador: nunca por debajo de lo configurado
@@ -214,9 +216,16 @@ class StrategyEngine:
         a.cvd_5m = delta
         a.cvd_ratio_5m = delta / vol if vol > 0 else 0.0
 
-        s1 = mk.series(1)
-        s5 = mk.series(c.regime_tf_minutes)
-        regime, m = self.regime.classify(s5)
+        s1 = mk.series(1, last_n=400)
+        # La TF de señal sólo cambia al cerrar una barra: se cachea (evita re-muestrear
+        # decenas de miles de velas 1m en cada evaluación).
+        key = (int(time.time() // (c.regime_tf_minutes * 60)), len(mk.bars) > 0)
+        cached = self._tf_cache.get(mk.product_id)
+        if cached is None or cached[0] != key:
+            s5 = mk.series(c.regime_tf_minutes)
+            cached = (key, s5, self.regime.classify(s5))
+            self._tf_cache[mk.product_id] = cached
+        _, s5, (regime, m) = cached
         a.regime = regime
         a.hurst = m.get("hurst", float("nan"))
         a.adx = m.get("adx", float("nan"))
@@ -296,10 +305,10 @@ class StrategyEngine:
         released = bool(np.any(recent)) and not bool(sq[-1])
         price = a.best_bid if not math.isnan(a.best_bid) else a.price
         avg_vol = float(np.mean(vol[-21:-1])) if len(vol) > 21 else float("nan")
-        # volumen del bloque 5m en curso + último cerrado (confirmación viva)
-        live_vol = sum(t.size for t in mk.window_trades(300))
+        # volumen de la barra en curso (misma duración que la TF de señal)
+        live_vol = sum(t.size for t in mk.window_trades(c.regime_tf_minutes * 60))
         checks = {
-            "squeeze_release": released,
+            "squeeze_release": released or not c.breakout_require_squeeze,
             "close>BB_up": close[-1] > bb_u[-1],
             "price>VWAP": not math.isnan(a.vwap) and price > a.vwap,
             "volumen": not math.isnan(avg_vol) and max(vol[-1], live_vol) >= c.volume_confirm_mult * avg_vol,
@@ -338,7 +347,7 @@ class StrategyEngine:
             "VWAP-2.5σ": not math.isnan(lower_band) and price <= lower_band,
             "RSI1m": not math.isnan(a.rsi_1m) and a.rsi_1m <= c.rsi_1m_oversold,
             "RSI5m": not math.isnan(a.rsi_5m) and a.rsi_5m <= c.rsi_5m_oversold,
-            "absorción": absorption,
+            "absorción": absorption or not c.mr_require_absorption,
         }
         failed = [k for k, v in checks.items() if not v]
         if failed:

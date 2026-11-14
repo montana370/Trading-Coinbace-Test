@@ -120,6 +120,12 @@ class Gateway(ABC):
     async def place_market_sell(self, product_id: str, base_size: float, client_order_id: str) -> str: ...
 
     @abstractmethod
+    async def place_bracket_sell(
+        self, product_id: str, base_size: float, limit_price: float, stop_trigger: float, client_order_id: str
+    ) -> str:
+        """Venta bracket GTC: límite de TP + stop de protección residente en el exchange."""
+
+    @abstractmethod
     async def cancel(self, order_ids: list[str]) -> None: ...
 
     @abstractmethod
@@ -207,6 +213,18 @@ class CoinbaseGateway(Gateway):
         resp = await self._call(
             fn, client_order_id=client_order_id, product_id=product_id,
             base_size=size_s, limit_price=price_s, post_only=True,
+        )
+        return self._parse_create(resp)
+
+    async def place_bracket_sell(
+        self, product_id: str, base_size: float, limit_price: float, stop_trigger: float, client_order_id: str
+    ) -> str:
+        m = self.meta(product_id)
+        resp = await self._call(
+            self.client.trigger_bracket_order_gtc_sell, client_order_id=client_order_id, product_id=product_id,
+            base_size=fmt_step(round_step(base_size, m.base_increment), m.base_increment),
+            limit_price=fmt_step(round_step(limit_price, m.quote_increment, up=True), m.quote_increment),
+            stop_trigger_price=fmt_step(round_step(stop_trigger, m.quote_increment), m.quote_increment),
         )
         return self._parse_create(resp)
 
@@ -311,6 +329,7 @@ class _PaperOrder:
     notional: float = 0.0
     fees: float = 0.0
     queue_ahead: float = 0.0
+    stop_trigger: float = 0.0          # >0 ⇒ orden bracket
     status: OrderStatus = OrderStatus.OPEN
 
     @property
@@ -451,6 +470,24 @@ class PaperGateway(Gateway):
         await self._emit(self._update(order))
         return order.order_id
 
+    async def place_bracket_sell(
+        self, product_id: str, base_size: float, limit_price: float, stop_trigger: float, client_order_id: str
+    ) -> str:
+        m = self.meta(product_id)
+        size = round_step(base_size, m.base_increment)
+        base = product_id.split("-")[0]
+        if size < m.base_min_size or self._available(base) < size - 1e-12:
+            raise ExchangeError("INSUFFICIENT_FUND")
+        order = _PaperOrder(
+            order_id=f"paper-{uuid.uuid4().hex[:20]}", client_order_id=client_order_id, product_id=product_id,
+            side=Side.SELL, price=round_step(limit_price, m.quote_increment, up=True), size=size,
+            stop_trigger=round_step(stop_trigger, m.quote_increment),
+            queue_ahead=self.markets[product_id].book.asks.get(limit_price, 0.0),
+        )
+        self.orders[order.order_id] = order
+        await self._emit(self._update(order))
+        return order.order_id
+
     async def cancel(self, order_ids: list[str]) -> None:
         for oid in order_ids:
             o = self.orders.get(oid)
@@ -486,6 +523,20 @@ class PaperGateway(Gateway):
         """Matching de órdenes límite contra el flujo de trades real."""
         for o in list(self.orders.values()):
             if o.status is not OrderStatus.OPEN or o.product_id != product_id:
+                continue
+            if o.stop_trigger > 0 and price <= o.stop_trigger:
+                # disparo del stop del bracket: ejecución a mercado (taker) al precio negociado
+                fill = o.leaves
+                notional = fill * price
+                fee = notional * self.taker_fee
+                base = product_id.split("-")[0]
+                o.filled += fill
+                o.notional += notional
+                o.fees += fee
+                self.balances[base] = self.balances.get(base, 0.0) - fill
+                self.balances[self.quote] = self.balances.get(self.quote, 0.0) + notional - fee
+                o.status = OrderStatus.FILLED
+                await self._emit(self._update(o))
                 continue
             crossed = (o.side is Side.BUY and price < o.price) or (o.side is Side.SELL and price > o.price)
             at_level = math.isclose(price, o.price, rel_tol=0, abs_tol=1e-12)

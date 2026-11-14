@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import hashlib
 import hmac
 import json
@@ -61,7 +62,53 @@ TIMEFRAMES: dict[str, tuple[str, int]] = {
 }
 
 db = Database(SETTINGS.runtime.db_path)
-app = FastAPI(title="Quant Terminal", docs_url=None, redoc_url=None, openapi_url=None)
+
+
+async def engine_watchdog() -> None:
+    """
+    Vigilancia independiente del Core Engine (corre en el proceso web): si el
+    motor deja de latir > ENGINE_DOWN_ALERT_S, avisa por Telegram; y avisa al
+    recuperarse. Así la alerta llega aunque el motor esté caído.
+    """
+    token, chat = SETTINGS.creds.telegram_token, SETTINGS.creds.telegram_chat_id
+    threshold = float(os.getenv("ENGINE_DOWN_ALERT_S", "60"))
+    down_since: float | None = None
+    started = time.time()
+    while True:
+        await asyncio.sleep(10)
+        hb = db.get_kv("engine_heartbeat", 0) or 0
+        stale = time.time() - hb
+        if stale > threshold and time.time() - started > threshold:
+            if down_since is None:
+                down_since = time.time()
+                positions = len(db.open_positions(db.get_kv("mode", "PAPER")))
+                await _telegram(token, chat,
+                                f"🚨 <b>CORE ENGINE SIN RESPUESTA</b> desde hace {int(stale)}s.\n"
+                                f"Posiciones abiertas: {positions} (protegidas por los stops en el exchange).")
+        elif down_since is not None and stale < 15:
+            await _telegram(token, chat, f"✅ Core Engine recuperado tras {int(time.time() - down_since)}s.")
+            down_since = None
+
+
+async def _telegram(token: str, chat: str, text: str) -> None:
+    if not (token and chat):
+        return
+    try:
+        async with httpx.AsyncClient(timeout=10) as c:
+            await c.post(f"https://api.telegram.org/bot{token}/sendMessage",
+                         json={"chat_id": chat, "text": text, "parse_mode": "HTML"})
+    except httpx.HTTPError:
+        pass
+
+
+@contextlib.asynccontextmanager
+async def lifespan(_: FastAPI):  # type: ignore[no-untyped-def]
+    task = asyncio.create_task(engine_watchdog())
+    yield
+    task.cancel()
+
+
+app = FastAPI(title="Quant Terminal", docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -217,6 +264,7 @@ async def state() -> JSONResponse:
             "bot_status", "status_detail", "mode", "ws_latency_ms", "api_latency_ms", "heartbeat_age_s",
             "ws_connected", "oracle", "equity", "cash", "day_start_equity", "daily_dd_pct", "fees",
             "consecutive_losses", "open_positions", "max_open_positions", "credentials_source", "live_allowed",
+            "signal_tf_minutes", "account_value",
         )},
         "pairs": [pairs[p] for p in SETTINGS.pairs],
         "positions": [_position_view(p) for p in db.open_positions(mode)],

@@ -32,7 +32,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
-from config import ORACLE_PRODUCT, SETTINGS, Settings
+from config import ORACLE_PRODUCT, SETTINGS, Settings, required_history_1m
 from database import AsyncDatabase
 from exchange import CoinbaseGateway, Gateway, PaperGateway, map_status
 from execution_handler import ExecutionHandler
@@ -69,7 +69,7 @@ class TradingEngine:
         self.s = settings
         self.db = AsyncDatabase(settings.runtime.db_path)
         self.markets: dict[str, MarketState] = {
-            pid: MarketState(pid, max_bars=settings.strategy.history_bars_1m) for pid in settings.pairs
+            pid: MarketState(pid, max_bars=required_history_1m(settings.strategy)) for pid in settings.pairs
         }
         self.strategy = StrategyEngine(settings.strategy, settings.fees, settings.oracle, settings.pairs)
         self.risk = RiskManager(settings.risk, settings.pairs, settings.execution.min_net_rr)
@@ -87,6 +87,7 @@ class TradingEngine:
         self.api_latency_ms = 0.0
         self.equity = 0.0
         self.cash = 0.0
+        self.account_value = 0.0
         self.balances: dict[str, float] = {}
         self._last_signal_ts: dict[str, float] = {}
 
@@ -220,7 +221,7 @@ class TradingEngine:
             log.warning("No se pudo leer el fee tier: %s", exc)
 
     async def _seed_history(self) -> None:
-        minutes = self.s.strategy.history_bars_1m
+        minutes = required_history_1m(self.s.strategy)
 
         async def seed(pid: str) -> None:
             try:
@@ -684,13 +685,22 @@ class TradingEngine:
             return
         quote = "USDC"
         cash = self.balances.get(quote, 0.0)
-        eq = cash
+        # Valor total de la cuenta en el universo (informativo)
+        account = cash
         for pid, mk in self.markets.items():
-            base = pid.split("-")[0]
             px = mk.book.mid or mk.last_price
             if px and not math.isnan(px):
-                eq += self.balances.get(base, 0.0) * px
-        self.cash, self.equity = cash, eq
+                account += self.balances.get(pid.split("-")[0], 0.0) * px
+        # Equity GESTIONADO por el bot = USDC + posiciones abiertas por el bot.
+        # Las tenencias propias del usuario (p. ej. SOL comprado a mano) no
+        # cuentan: su caída no debe disparar el Daily Drawdown del bot.
+        managed = cash
+        for p in self.execution.positions.values():
+            mk = self.markets[p.product_id]
+            px = mk.book.best_bid or mk.last_price
+            if px and not math.isnan(px):
+                managed += p.size * px
+        self.cash, self.equity, self.account_value = cash, managed, account
 
     async def equity_loop(self) -> None:
         while not self.stop_event.is_set():
@@ -796,6 +806,7 @@ class TradingEngine:
                        "cvd_ratio": o.cvd_ratio, "obi": o.obi, "since": o.since},
             "equity": self.equity,
             "cash": self.cash,
+            "account_value": self.account_value,
             "day_start_equity": self.risk.state.day_start_equity,
             "daily_dd_pct": self.risk.daily_drawdown_pct(self.equity) if self.equity else 0.0,
             "fees": {"maker": self.strategy.maker_fee, "taker": self.strategy.taker_fee},
@@ -804,6 +815,7 @@ class TradingEngine:
             "open_positions": len(self.execution.positions),
             "max_open_positions": self.s.risk.max_open_positions,
             "credentials_source": self.creds_source,
+            "signal_tf_minutes": self.s.strategy.regime_tf_minutes,
             "live_allowed": self.s.runtime.allow_live,
             "universe": list(self.s.pairs),
         }

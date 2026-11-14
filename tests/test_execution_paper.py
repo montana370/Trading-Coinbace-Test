@@ -110,3 +110,66 @@ async def test_post_only_never_crosses_and_chase_aborts_on_escape(tmp_path):
     res = await ex._chase(sig, sizing)
     assert res.filled == 0 and "escapó" in res.reason
     await db.close()
+
+
+async def _open_position(tmp_path, settings):
+    markets = {p: MarketState(p) for p in settings.pairs}
+    mk = markets[PID]
+    mk.quote_increment = 0.01
+    _book(mk, 99.99, 100.01)
+    gw = PaperGateway(markets, 10_000.0, 0.004, 0.006)
+    for p in settings.pairs:
+        gw.products[p] = ProductMeta(p, 0.001, 0.01, 0.001, 1.0)
+    strat = StrategyEngine(settings.strategy, settings.fees, settings.oracle, settings.pairs)
+    strat.analytics[PID].atr = 2.0
+    risk = RiskManager(settings.risk, settings.pairs, settings.execution.min_net_rr)
+    db = AsyncDatabase(tmp_path / "s.db")
+    ex = ExecutionHandler(settings, gw, markets, strat, risk, db, TelegramNotifier("", ""),
+                          validator=lambda s: (True, "OK"))
+    sig = Signal(PID, StrategyName.BREAKOUT, Side.BUY, Regime.TREND, 99.99, 96.0, 112.0, 2.0, 0.3, 12.0, "test")
+    sizing = risk.size_position(sig, 99.99, 10_000, 10_000, 0.004, 0.006, gw.meta(PID), [])
+    ex.submit_entry(sig, sizing)
+    await asyncio.sleep(0.05)
+    await gw.on_market_trade(PID, 99.98, 1000.0)
+    await asyncio.wait_for(ex.entry_tasks[PID], 2.0)
+    return gw, ex, db, mk
+
+
+@pytest.mark.asyncio
+async def test_exchange_stop_protects_when_engine_is_down(tmp_path):
+    gw, ex, db, mk = await _open_position(tmp_path, SETTINGS)
+    pos = next(iter(ex.positions.values()))
+    brackets = [o for o in gw.orders.values() if o.stop_trigger > 0 and o.status.value == "OPEN"]
+    assert brackets and sum(o.size for o in brackets) == pytest.approx(pos.size)
+    trigger = brackets[0].stop_trigger
+    assert trigger < pos.stop_price                       # respaldo por debajo del stop software
+    # el motor NO gestiona (caído): sólo llegan trades del mercado en caída
+    await gw.on_market_trade(PID, trigger - 0.5, 50.0)
+    for _ in range(50):
+        if not ex.positions:
+            break
+        await asyncio.sleep(0.02)
+    assert not ex.positions
+    t = (await db.run(db.sync.trades))[0]
+    assert t["exit_reason"] == "STOP EN EXCHANGE"
+    assert t["net_pnl"] == pytest.approx(t["gross_pnl"] - t["fees"])
+    assert gw.balances["USDC"] == pytest.approx(10_000 + t["net_pnl"], abs=1e-6)
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_brackets_follow_breakeven(tmp_path):
+    import dataclasses
+    fast = dataclasses.replace(SETTINGS, execution=dataclasses.replace(SETTINGS.execution, exchange_stop_min_update_s=0.0))
+    gw, ex, db, mk = await _open_position(tmp_path, fast)
+    pos = next(iter(ex.positions.values()))
+    before = {o.stop_trigger for o in gw.orders.values() if o.stop_trigger > 0 and o.status.value == "OPEN"}
+    _book(mk, 105.0, 105.02)                              # +1.2R → breakeven
+    await ex.manage_positions()
+    await asyncio.gather(*ex._stop_update_tasks.values())
+    after = {o.stop_trigger for o in gw.orders.values() if o.stop_trigger > 0 and o.status.value == "OPEN"}
+    assert pos.breakeven_armed
+    assert min(after) > max(before) and min(after) >= pos.entry_price * 0.99
+    open_sz = sum(o.leaves for o in gw.orders.values() if o.stop_trigger > 0 and o.status.value == "OPEN")
+    assert open_sz == pytest.approx(pos.size)             # todo el inventario sigue protegido
+    await db.close()

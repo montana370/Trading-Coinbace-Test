@@ -9,6 +9,7 @@ market_data.py — Estado de mercado en memoria por par.
 from __future__ import annotations
 
 import heapq
+import itertools
 import math
 import time
 from collections import deque
@@ -305,8 +306,8 @@ class MarketState:
         return (ts[-1].price - ts[0].price) / ts[0].price * 100.0
 
     # ── series de barras ────────────────────────────────────────────────────
-    def series(self, tf_minutes: int = 1, include_partial: bool = False) -> dict[str, np.ndarray]:
-        bars = list(self.bars)
+    def series(self, tf_minutes: int = 1, include_partial: bool = False, last_n: int | None = None) -> dict[str, np.ndarray]:
+        bars = list(self.bars) if last_n is None else list(itertools.islice(self.bars, max(len(self.bars) - last_n, 0), None))
         if not include_partial and bars and time.time() < bars[-1].start + 60.0:
             bars = bars[:-1]
         if tf_minutes > 1:
