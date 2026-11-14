@@ -1,0 +1,7 @@
+coinbase-advanced-py>=1.8.0
+aiohttp>=3.9
+numpy>=1.26
+pandas>=2.1
+streamlit>=1.48
+plotly>=5.18
+python-dotenv>=1.0
