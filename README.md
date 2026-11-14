@@ -83,7 +83,9 @@ dedicado (`AsyncDatabase`) y Telegram por una cola (`put_nowait`).
 ├── execution_handler.py   # Smart Order Chasing Maker-Only, TPs, trailing, Kill-Switch, reconciliación
 ├── telegram_bot.py        # Alertas asíncronas + /status /pause /resume /panic
 ├── main.py                # Orquestador asíncrono (Core Engine)
-├── dashboard.py           # Terminal visual Streamlit
+├── dashboard.py           # Plataforma web (FastAPI): sesión, API, gráficas, comandos
+├── credentials.py         # Almacén cifrado de la clave API + detección de portafolio
+├── static/                # SPA mobile-first (HTML/CSS/JS) + TradingView Lightweight Charts
 ├── tests/                 # Unitarios + integración PAPER + engine end-to-end offline
 ├── requirements.txt / requirements-dev.txt / .env.example / pytest.ini
 ```
@@ -96,7 +98,7 @@ pip install -r requirements-dev.txt
 cp .env.example .env            # rellena claves CDP y Telegram
 pytest -q                       # 14 tests
 python main.py                  # proceso 1: Core Engine
-streamlit run dashboard.py      # proceso 2: Dashboard  →  http://localhost:8501
+python dashboard.py             # proceso 2: Plataforma web  →  http://localhost:8501
 ```
 
 Claves CDP: crea una API key en el *Coinbase Developer Platform* con permisos **View + Trade** (sin
@@ -165,7 +167,26 @@ Variables en Railway → *Variables*:
 | Variable | Obligatoria | Notas |
 |---|---|---|
 | `DASHBOARD_PASSWORD` | sí | el dashboard es público y tiene Kill-Switch; sin ella el contenedor no arranca |
+| `CREDENTIALS_KEY` | sí | cifra la clave API guardada desde la web |
 | `DB_PATH` | — | por defecto `/data/trading_state.db` (volumen) |
 | `TRADING_MODE` / `ALLOW_LIVE_TRADING` | — | `PAPER` / `false` por defecto |
 | `COINBASE_API_KEY` / `COINBASE_API_SECRET` | para LIVE | pegar la clave PEM con `\n` literales |
 | `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | opcional | alertas y comandos |
+
+## 8. Plataforma web
+
+SPA mobile-first (también se adapta a escritorio) servida por FastAPI:
+
+- **Inicio:** equity y curva, PnL neto/bruto, KPIs, oráculo BTC, mercados, posiciones abiertas,
+  Pausar/Reanudar y PANIC (mantener pulsado 1,5 s).
+- **Activos:** una sección por par con velas oficiales de Coinbase (1m–1d) dibujadas con TradingView
+  Lightweight Charts. Marca compras ▲ y ventas ▼ (con % neto), y las líneas de entrada, SL (o trailing),
+  TPs escalonados y breakeven de la posición abierta. Tocar un trade del historial centra la gráfica en él
+  y dibuja su SL/TP.
+- **Portafolio:** se detecta automáticamente al guardar la clave API (saldos, valor en USD, asignación,
+  PnL no realizado, permisos de la clave).
+- **Ajustes:** sesión para introducir la clave API. Se valida contra Coinbase, se rechaza si tiene permiso
+  de transferencia, se guarda cifrada (Fernet, con `CREDENTIALS_KEY`) y el motor la recarga sin reinicio.
+  Desde aquí también se cambia el modo PAPER/LIVE y se ve la actividad del motor.
+
+Variables adicionales: `CREDENTIALS_KEY` (obligatoria para guardar claves desde la web, mín. 16 caracteres).

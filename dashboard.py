@@ -1,371 +1,426 @@
 """
-dashboard.py — Terminal visual en tiempo real (Streamlit).
+dashboard.py — Plataforma web (FastAPI + SPA móvil) — proceso independiente del Core Engine.
 
-Proceso independiente del Core Engine: sólo LEE el estado compartido en
-SQLite (WAL, lectores concurrentes sin bloquear al escritor) y ESCRIBE en el
-bus `commands`. El refresco usa `st.fragment(run_every=…)`, que re-renderiza
-sólo los paneles vivos sin recargar la página ni los controles.
+* Lee el estado compartido en SQLite WAL y escribe sólo en el bus `commands`
+  (y en el almacén cifrado de credenciales).
+* Sesión por cookie firmada (HMAC-SHA256), HttpOnly + SameSite=Strict.
+* Gráficas: velas oficiales de Coinbase (endpoint público, en caché) dibujadas
+  en el navegador con TradingView Lightweight Charts, con entradas, salidas,
+  SL/TP y breakeven marcados.
+* Sesión de configuración de API: valida la clave contra Coinbase, la guarda
+  cifrada, detecta el portafolio y ordena al motor recargarla.
 
-Uso:  streamlit run dashboard.py
+Uso:  python dashboard.py      (escucha en $PORT, por defecto 8501)
 """
 from __future__ import annotations
 
+import asyncio
+import base64
+import hashlib
 import hmac
+import json
 import math
 import os
+import secrets
 import time
-from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
-import pandas as pd
-import plotly.graph_objects as go
-import streamlit as st
+import httpx
+import uvicorn
+from fastapi import Depends, FastAPI, HTTPException, Request, Response
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
 
 from config import SETTINGS
+from credentials import (
+    CredentialError,
+    delete_credentials,
+    detect_portfolio,
+    load_credentials,
+    save_credentials,
+    validate_credentials,
+)
 from database import Database
 
-REFRESH_S = 1.0
+ROOT = Path(__file__).resolve().parent
+STATIC = ROOT / "static"
+COOKIE = "qt_session"
+SESSION_TTL = 7 * 86400
+PASSWORD = os.getenv("DASHBOARD_PASSWORD", "")
+COINBASE_PUBLIC = "https://api.coinbase.com/api/v3/brokerage/market/products/{pid}/candles"
 
-st.set_page_config(page_title="Quant Terminal · Coinbase", page_icon="📈", layout="wide")
+TIMEFRAMES: dict[str, tuple[str, int]] = {
+    "1m": ("ONE_MINUTE", 60),
+    "5m": ("FIVE_MINUTE", 300),
+    "15m": ("FIFTEEN_MINUTE", 900),
+    "1h": ("ONE_HOUR", 3600),
+    "6h": ("SIX_HOUR", 21600),
+    "1d": ("ONE_DAY", 86400),
+}
 
-
-def require_auth() -> None:
-    """Puerta de acceso: obligatoria si DASHBOARD_PASSWORD está definida (siempre en Railway)."""
-    expected = os.getenv("DASHBOARD_PASSWORD", "")
-    if not expected or st.session_state.get("auth_ok"):
-        return
-    st.title("🔒 Quant Terminal")
-    entered = st.text_input("Contraseña del dashboard", type="password")
-    if entered:
-        if hmac.compare_digest(entered.encode(), expected.encode()):
-            st.session_state["auth_ok"] = True
-            st.rerun()
-        time.sleep(1.0)  # frena fuerza bruta
-        st.error("Contraseña incorrecta")
-    st.stop()
-
-
-require_auth()
-
-st.markdown(
-    """
-<style>
-:root { --up:#16a34a; --down:#dc2626; --warn:#d97706; --muted:#6b7280; }
-.block-container { padding-top: 1.2rem; }
-.badge { display:inline-block; padding:4px 12px; border-radius:6px; font-weight:700; font-size:0.95rem; }
-.b-run { background:#16a34a22; color:#16a34a; border:1px solid #16a34a; }
-.b-pause { background:#d9770622; color:#d97706; border:1px solid #d97706; }
-.b-kill { background:#dc262622; color:#dc2626; border:1px solid #dc2626; }
-.b-off { background:#6b728022; color:#6b7280; border:1px solid #6b7280; }
-.card { border:1px solid #8884; border-radius:10px; padding:12px 14px; height:100%; }
-.card h4 { margin:0 0 4px 0; }
-.kv { display:flex; justify-content:space-between; font-size:0.86rem; margin:2px 0; }
-.kv span:first-child { color:var(--muted); }
-.obi-track { position:relative; height:10px; background:#8883; border-radius:5px; margin:4px 0 2px; }
-.obi-mid { position:absolute; left:50%; top:-2px; width:1px; height:14px; background:#888; }
-.obi-fill { position:absolute; top:0; height:10px; border-radius:5px; }
-.small { font-size:0.78rem; color:var(--muted); }
-</style>
-""",
-    unsafe_allow_html=True,
-)
-
-
-@st.cache_resource
-def get_db() -> Database:
-    return Database(SETTINGS.runtime.db_path)
-
-
-db = get_db()
-
-
-def fmt_px(x: Any) -> str:
-    if x is None or (isinstance(x, float) and math.isnan(x)):
-        return "—"
-    x = float(x)
-    if x >= 1000:
-        return f"{x:,.2f}"
-    if x >= 1:
-        return f"{x:,.4f}"
-    return f"{x:.6f}"
-
-
-def fmt_ts(ts: float | None) -> str:
-    if not ts:
-        return "—"
-    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%m-%d %H:%M:%S")
-
-
-def status_badge(status: str) -> str:
-    cls = {"RUNNING": "b-run", "PAUSED": "b-pause", "SAFE": "b-pause", "KILLED": "b-kill"}.get(status, "b-off")
-    return f'<span class="badge {cls}">{status}</span>'
-
-
-def obi_bar(obi: float | None) -> str:
-    v = 0.0 if obi is None else max(-1.0, min(1.0, float(obi)))
-    width = abs(v) * 50
-    left = 50 if v >= 0 else 50 - width
-    color = "#16a34a" if v >= 0 else "#dc2626"
-    return (
-        f'<div class="obi-track"><div class="obi-mid"></div>'
-        f'<div class="obi-fill" style="left:{left}%;width:{width}%;background:{color}"></div></div>'
-    )
+db = Database(SETTINGS.runtime.db_path)
+app = FastAPI(title="Quant Terminal", docs_url=None, redoc_url=None, openapi_url=None)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# Controles (fuera del fragmento: no se re-renderizan cada segundo)
+# Sesión
 # ═════════════════════════════════════════════════════════════════════════════
-with st.sidebar:
-    st.header("🎛️ Control")
-    st.caption("Las órdenes viajan por el bus de comandos (SQLite) al Core Engine.")
+def _session_secret() -> bytes:
+    secret = db.get_kv("session_secret")
+    if not secret:
+        secret = secrets.token_hex(32)
+        db.set_kv("session_secret", secret)
+    return hashlib.sha256((secret + PASSWORD).encode()).digest()
 
-    st.subheader("🚨 Emergencia")
-    def _fire_panic() -> None:
-        st.session_state["panic_cid"] = db.push_command("PANIC", "dashboard")
-        st.session_state["arm_panic"] = False   # desarmar tras el disparo
 
-    armed = st.checkbox("Armar Kill-Switch", key="arm_panic")
-    st.button("PANIC KILL-SWITCH", type="primary", disabled=not armed, width="stretch",
-              on_click=_fire_panic)
-    if st.session_state.get("panic_cid"):
-        st.error(f"PANIC enviado (#{st.session_state['panic_cid']}). Cancelando órdenes y liquidando…")
+def _sign(payload: str) -> str:
+    return base64.urlsafe_b64encode(hmac.new(_session_secret(), payload.encode(), hashlib.sha256).digest()).decode()
 
-    st.subheader("Entradas")
-    c1, c2 = st.columns(2)
-    if c1.button("⏸️ Pausar", width="stretch"):
-        db.push_command("PAUSE", "dashboard")
-        st.toast("PAUSE enviado")
-    if c2.button("▶️ Reanudar", width="stretch"):
-        db.push_command("RESUME", "dashboard")
-        st.toast("RESUME enviado")
 
-    st.subheader("Modo")
-    current_mode = db.get_kv("mode", "PAPER")
-    target = st.radio("Modo de ejecución", ["PAPER", "LIVE"], index=0 if current_mode == "PAPER" else 1,
-                      horizontal=True)
-    if target != current_mode:
-        st.warning("Cambiar de modo exige estar sin posiciones. LIVE requiere ALLOW_LIVE_TRADING=true.")
-        confirm = st.text_input(f"Escribe {target} para confirmar", key="mode_confirm")
-        if st.button(f"Cambiar a {target}", disabled=confirm != target, width="stretch"):
-            db.push_command("SET_MODE", "dashboard", {"mode": target})
-            st.toast(f"SET_MODE {target} enviado")
+def make_token() -> str:
+    payload = f"{int(time.time()) + SESSION_TTL}.{secrets.token_hex(8)}"
+    return f"{payload}.{_sign(payload)}"
 
-    st.subheader("Últimos comandos")
-    cmds = db.recent_commands(8)
-    if cmds:
-        st.dataframe(
-            pd.DataFrame([{
-                "cmd": c["command"], "origen": c["source"], "enviado": fmt_ts(c["created_at"]),
-                "resultado": c["result"] or "⏳ pendiente",
-            } for c in cmds]),
-            hide_index=True, width="stretch",
+
+def token_valid(token: str | None) -> bool:
+    if not token or token.count(".") != 2:
+        return False
+    exp, nonce, sig = token.split(".")
+    if not hmac.compare_digest(sig, _sign(f"{exp}.{nonce}")):
+        return False
+    return exp.isdigit() and int(exp) > time.time()
+
+
+def require_auth(request: Request) -> None:
+    if PASSWORD and not token_valid(request.cookies.get(COOKIE)):
+        raise HTTPException(status_code=401, detail="No autenticado")
+
+
+_failed_logins: dict[str, list[float]] = {}
+
+
+class LoginBody(BaseModel):
+    password: str = Field(max_length=200)
+
+
+@app.post("/api/login")
+async def login(body: LoginBody, request: Request, response: Response) -> dict[str, Any]:
+    ip = (request.headers.get("x-forwarded-for") or (request.client.host if request.client else "?")).split(",")[0]
+    now = time.time()
+    recent = [t for t in _failed_logins.get(ip, []) if now - t < 900]
+    if len(recent) >= 10:
+        raise HTTPException(status_code=429, detail="Demasiados intentos. Espera 15 minutos.")
+    if not PASSWORD or hmac.compare_digest(body.password.encode(), PASSWORD.encode()):
+        _failed_logins.pop(ip, None)
+        secure = request.headers.get("x-forwarded-proto", request.url.scheme) == "https"
+        response.set_cookie(COOKIE, make_token(), max_age=SESSION_TTL, httponly=True,
+                            secure=secure, samesite="strict")
+        return {"ok": True}
+    recent.append(now)
+    _failed_logins[ip] = recent
+    await asyncio.sleep(1.0)
+    raise HTTPException(status_code=401, detail="Contraseña incorrecta")
+
+
+@app.post("/api/logout")
+async def logout(response: Response) -> dict[str, Any]:
+    response.delete_cookie(COOKIE)
+    return {"ok": True}
+
+
+@app.get("/api/me")
+async def me(request: Request) -> dict[str, Any]:
+    return {"authenticated": (not PASSWORD) or token_valid(request.cookies.get(COOKIE)),
+            "auth_required": bool(PASSWORD)}
+
+
+@app.get("/healthz")
+async def healthz() -> dict[str, Any]:
+    hb = db.get_kv("engine_heartbeat", 0) or 0
+    return {"ok": True, "engine_alive": time.time() - hb < 10}
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Estado / métricas
+# ═════════════════════════════════════════════════════════════════════════════
+def _clean(v: Any) -> Any:
+    if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
+        return None
+    return v
+
+
+def compute_kpis(trades: list[dict[str, Any]], equity: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    out: dict[str, Any] = {"trades": len(trades), "gross": 0.0, "net": 0.0, "fees": 0.0,
+                           "win_rate": None, "profit_factor": None, "avg_net": None,
+                           "drawdown_pct": 0.0, "max_drawdown_pct": 0.0, "best": None, "worst": None}
+    if trades:
+        nets = [t["net_pnl"] for t in trades]
+        wins = [n for n in nets if n > 0]
+        losses = [-n for n in nets if n < 0]
+        out.update(
+            gross=sum(t["gross_pnl"] for t in trades), net=sum(nets), fees=sum(t["fees"] for t in trades),
+            win_rate=len(wins) / len(trades) * 100, avg_net=sum(nets) / len(nets),
+            profit_factor=(sum(wins) / sum(losses)) if losses else None,
+            best=max(nets), worst=min(nets),
         )
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-# Paneles vivos
-# ═════════════════════════════════════════════════════════════════════════════
-@st.fragment(run_every=REFRESH_S)
-def live_header() -> None:
-    kv = db.all_kv()
-    hb = kv.get("engine_heartbeat", 0)
-    engine_alive = time.time() - (hb or 0) < 5
-    status = kv.get("bot_status", "OFFLINE") if engine_alive else "OFFLINE"
-    oracle = kv.get("oracle") or {}
-    mode = kv.get("mode", "—")
-
-    cols = st.columns([1.3, 1, 1, 1, 1, 2.2])
-    cols[0].markdown(f"**Estado**<br>{status_badge(status)}", unsafe_allow_html=True)
-    mode_cls = "b-kill" if mode == "LIVE" else "b-off"
-    cols[1].markdown(f"**Modo**<br><span class='badge {mode_cls}'>{mode}</span>", unsafe_allow_html=True)
-    cols[2].metric("Latencia WS", f"{kv.get('ws_latency_ms', 0):.0f} ms")
-    cols[3].metric("Latencia API", f"{kv.get('api_latency_ms', 0):.0f} ms")
-    hb_age = kv.get("heartbeat_age_s")
-    cols[4].metric("Heartbeat", f"{hb_age:.1f} s" if hb_age is not None else "—")
-    if oracle.get("veto"):
-        cols[5].markdown(f"**Oráculo BTC**<br><span class='badge b-kill'>VETO BAJISTA ACTIVO</span>"
-                         f"<div class='small'>{oracle.get('reason','')}</div>", unsafe_allow_html=True)
-    else:
-        cols[5].markdown(
-            f"**Oráculo BTC**<br><span class='badge b-run'>RISK-ON</span>"
-            f"<div class='small'>Δ5m {oracle.get('change_5m_pct',0):+.2f}% · CVD {oracle.get('cvd_ratio',0):+.2f}"
-            f" · OBI {oracle.get('obi',0):+.2f}</div>", unsafe_allow_html=True)
-    st.caption(
-        f"{kv.get('status_detail', '')} · Posiciones {kv.get('open_positions', 0)}/{kv.get('max_open_positions', 2)}"
-        f" · Pérdidas consecutivas {kv.get('consecutive_losses', 0)}"
-        f" · Fees maker {kv.get('fees', {}).get('maker', 0)*100:.2f}% / taker {kv.get('fees', {}).get('taker', 0)*100:.2f}%"
-        + ("" if engine_alive else " · ⚠️ CORE ENGINE SIN LATIDO")
-    )
-
-
-@st.fragment(run_every=REFRESH_S)
-def live_pairs() -> None:
-    st.subheader("Matriz en vivo")
-    rows = {r["product_id"]: r for r in db.query("SELECT * FROM pair_snapshot")}
-    cols = st.columns(4)
-    for col, pid in zip(cols, SETTINGS.pairs):
-        r = rows.get(pid)
-        cfg = SETTINGS.pairs[pid]
-        with col:
-            if not r:
-                st.markdown(f"<div class='card'><h4>{pid}</h4><div class='small'>sin datos</div></div>",
-                            unsafe_allow_html=True)
-                continue
-            spread = r["spread_pct"]
-            sp_ok = spread is not None and spread <= cfg.max_spread_pct
-            sp_txt = f"{spread:.3f}%" if spread is not None else "—"
-            fee_ok = bool(r["fee_filter_ok"])
-            regime = r["regime"]
-            reg_color = {"TREND": "#2563eb", "RANGE": "#7c3aed", "NOISE": "#dc2626"}.get(regime, "#6b7280")
-            st.markdown(
-                f"""<div class='card'>
-<h4>{pid.split('-')[0]} <span class='small'>{cfg.role.value}</span></h4>
-<div style='font-size:1.5rem;font-weight:700'>{fmt_px(r['price'])}</div>
-<div class='kv'><span>Spread / máx</span><span style='color:{"#16a34a" if sp_ok else "#dc2626"}'>{sp_txt} / {cfg.max_spread_pct:.2f}%</span></div>
-<div class='kv'><span>OBI L2</span><span>{(r['obi'] or 0):+.2f}</span></div>
-{obi_bar(r['obi'])}
-<div class='kv'><span>ATR (5m)</span><span>{fmt_px(r['atr'])} ({(r['atr_pct'] or 0):.2f}%)</span></div>
-<div class='kv'><span>Régimen</span><span style='color:{reg_color};font-weight:700'>{regime}</span></div>
-<div class='kv'><span>Hurst / ADX</span><span>{(r['hurst'] or 0):.2f} / {(r['adx'] or 0):.1f}</span></div>
-<div class='kv'><span>VWAP</span><span>{fmt_px(r['vwap'])}</span></div>
-<div class='kv'><span>Recorrido proy.</span><span>{(r['projected_move_pct'] or 0):.2f}%</span></div>
-<div class='kv'><span>Filtro comisiones</span><span>{'✅ PASA' if fee_ok else '❌ BLOQUEA'}</span></div>
-<div class='small' style='margin-top:6px'>{r['signal'] or ''}</div>
-<div class='small'>Asignación máx {cfg.max_allocation*100:.0f}%</div>
-</div>""",
-                unsafe_allow_html=True,
-            )
-
-
-def compute_kpis(trades: pd.DataFrame, equity: pd.DataFrame) -> dict[str, Any]:
-    out: dict[str, Any] = {"gross": 0.0, "net": 0.0, "fees": 0.0, "win_rate": None, "pf": None,
-                           "n": 0, "dd": 0.0, "max_dd": 0.0}
-    if not trades.empty:
-        out["gross"] = trades["gross_pnl"].sum()
-        out["net"] = trades["net_pnl"].sum()
-        out["fees"] = trades["fees"].sum()
-        out["n"] = len(trades)
-        wins = trades[trades["net_pnl"] > 0]["net_pnl"]
-        losses = trades[trades["net_pnl"] < 0]["net_pnl"]
-        out["win_rate"] = len(wins) / len(trades) * 100
-        out["pf"] = (wins.sum() / -losses.sum()) if len(losses) and losses.sum() != 0 else None
-    if not equity.empty:
-        eq = equity["equity"]
-        peak = eq.cummax()
-        dd = (peak - eq) / peak * 100
-        out["dd"] = float(dd.iloc[-1])
-        out["max_dd"] = float(dd.max())
+    if equity:
+        peak, max_dd = 0.0, 0.0
+        for row in equity:
+            peak = max(peak, row["equity"])
+            if peak > 0:
+                max_dd = max(max_dd, (peak - row["equity"]) / peak * 100)
+        last = equity[-1]["equity"]
+        out["drawdown_pct"] = (peak - last) / peak * 100 if peak > 0 else 0.0
+        out["max_drawdown_pct"] = max_dd
     return out
 
 
-@st.fragment(run_every=REFRESH_S * 3)
-def live_performance() -> None:
+def _position_view(p: dict[str, Any]) -> dict[str, Any]:
+    st = json.loads(p.get("state_json") or "{}")
+    mark = p.get("mark_price") or p["entry_price"]
+    return {
+        "position_id": p["position_id"], "product_id": p["product_id"], "strategy": p["strategy"],
+        "regime": p["regime"], "entry_price": p["entry_price"], "size": p["size"],
+        "initial_size": p["initial_size"], "stop_price": p["stop_price"], "initial_stop": p["initial_stop"],
+        "take_profit": p["take_profit"], "breakeven_price": p["breakeven_price"],
+        "breakeven_armed": bool(p["breakeven_armed"]), "mark_price": mark,
+        "unrealized_net": p["unrealized_net"], "entry_fee_paid": p["entry_fee_paid"],
+        "opened_at": p["opened_at"], "notional": mark * p["size"],
+        "dist_sl_pct": (mark - p["stop_price"]) / mark * 100 if mark else None,
+        "dist_tp_pct": (p["take_profit"] - mark) / mark * 100 if mark else None,
+        "tp_levels": [{"price": lv["price"], "fraction": lv["fraction"], "filled": lv.get("filled", False)}
+                      for lv in st.get("tp_levels", [])],
+    }
+
+
+@app.get("/api/state", dependencies=[Depends(require_auth)])
+async def state() -> JSONResponse:
     kv = db.all_kv()
     mode = kv.get("mode", "PAPER")
-    trades = pd.DataFrame(db.trades(mode))
-    equity = pd.DataFrame(db.equity_curve(mode))
-    k = compute_kpis(trades, equity)
-    st.subheader(f"Rendimiento ({mode})")
-    c = st.columns(8)
-    c[0].metric("Equity", f"{kv.get('equity', 0):,.0f}")
-    c[1].metric("PnL Bruto", f"{k['gross']:+,.2f}")
-    c[2].metric("PnL Neto", f"{k['net']:+,.2f}", delta=f"-{k['fees']:,.2f} fees", delta_color="off")
-    c[3].metric("Win Rate", f"{k['win_rate']:.1f}%" if k["win_rate"] is not None else "—")
-    c[4].metric("Profit Factor", f"{k['pf']:.2f}" if k["pf"] is not None else "—")
-    c[5].metric("Drawdown", f"{k['dd']:.2f}%", delta=f"máx {k['max_dd']:.2f}%", delta_color="off")
-    c[6].metric("DD diario", f"{kv.get('daily_dd_pct', 0):.2f}%", delta="límite 3.00%", delta_color="off")
-    c[7].metric("Trades", f"{k['n']}")
-
-    if not equity.empty:
-        equity["time"] = pd.to_datetime(equity["ts"], unit="s", utc=True)
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(x=equity["time"], y=equity["equity"], mode="lines", name="Equity",
-                                 line=dict(width=2, color="#2563eb"), fill="tozeroy",
-                                 fillcolor="rgba(37,99,235,0.08)"))
-        lo, hi = equity["equity"].min(), equity["equity"].max()
-        pad = max((hi - lo) * 0.15, hi * 0.002)
-        fig.update_layout(height=280, margin=dict(l=10, r=10, t=10, b=10), yaxis_range=[lo - pad, hi + pad],
-                          hovermode="x unified", showlegend=False)
-        st.plotly_chart(fig, width="stretch", key="equity_chart")
-    else:
-        st.info("Curva de equity disponible tras el primer muestreo del Core Engine.")
-
-
-@st.fragment(run_every=REFRESH_S)
-def live_positions() -> None:
-    kv = db.all_kv()
-    mode = kv.get("mode", "PAPER")
-    st.subheader("Posiciones abiertas")
-    pos = db.open_positions(mode)
-    if pos:
-        rows = []
-        for p in pos:
-            mark = p["mark_price"] or p["entry_price"]
-            rows.append({
-                "Par": p["product_id"],
-                "Estrategia": p["strategy"],
-                "Entrada": fmt_px(p["entry_price"]),
-                "Tamaño": f"{p['size']:g}",
-                "Mark": fmt_px(mark),
-                "PnL neto flotante": round(p["unrealized_net"] or 0.0, 2),
-                "BE ajustado fees": fmt_px(p["breakeven_price"]),
-                "BE armado": "✅" if p["breakeven_armed"] else "—",
-                "Stop": fmt_px(p["stop_price"]),
-                "Dist. SL %": round((mark - p["stop_price"]) / mark * 100, 2) if mark else None,
-                "TP": fmt_px(p["take_profit"]),
-                "Dist. TP %": round((p["take_profit"] - mark) / mark * 100, 2) if mark else None,
-                "Abierta": fmt_ts(p["opened_at"]),
-            })
-        st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
-    else:
-        st.caption("Sin posiciones abiertas.")
-
-    st.subheader("Órdenes activas")
-    orders = [o for o in db.active_orders() if o["mode"] == mode]
-    if orders:
-        st.dataframe(pd.DataFrame([{
-            "Par": o["product_id"], "Lado": o["side"], "Tipo": o["purpose"],
-            "Precio": fmt_px(o["price"]), "Tamaño": o["size"], "Llenado": o["filled_size"],
-            "Estado": o["status"], "Creada": fmt_ts(o["created_at"]),
-        } for o in orders]), hide_index=True, width="stretch")
-    else:
-        st.caption("Sin órdenes activas.")
+    hb = kv.get("engine_heartbeat") or 0
+    pairs = {r["product_id"]: {k: _clean(v) for k, v in r.items()} for r in db.query("SELECT * FROM pair_snapshot")}
+    for pid, cfg in SETTINGS.pairs.items():
+        pairs.setdefault(pid, {"product_id": pid})
+        pairs[pid].update(role=cfg.role.value, max_spread_pct=cfg.max_spread_pct,
+                          max_allocation=cfg.max_allocation, base=cfg.base_currency)
+    trades = db.trades(mode)
+    since = time.time() - 30 * 86400
+    equity = db.equity_curve(mode, since, max_points=600)
+    day_start = time.time() - (time.time() % 86400)
+    today = [t for t in trades if t["closed_at"] >= day_start]
+    body = {
+        "server_time": time.time(),
+        "engine_alive": time.time() - hb < 10,
+        "telemetry": {k: kv.get(k) for k in (
+            "bot_status", "status_detail", "mode", "ws_latency_ms", "api_latency_ms", "heartbeat_age_s",
+            "ws_connected", "oracle", "equity", "cash", "day_start_equity", "daily_dd_pct", "fees",
+            "consecutive_losses", "open_positions", "max_open_positions", "credentials_source", "live_allowed",
+        )},
+        "pairs": [pairs[p] for p in SETTINGS.pairs],
+        "positions": [_position_view(p) for p in db.open_positions(mode)],
+        "orders": [o for o in db.active_orders() if o["mode"] == mode],
+        "kpis": compute_kpis(trades, equity),
+        "kpis_today": compute_kpis(today),
+        "equity": [{"t": r["ts"], "v": r["equity"]} for r in equity],
+    }
+    return JSONResponse(body)
 
 
-@st.fragment(run_every=REFRESH_S * 3)
-def live_history() -> None:
-    kv = db.all_kv()
-    mode = kv.get("mode", "PAPER")
-    left, right = st.columns([3, 2])
-    with left:
-        st.subheader("Trades cerrados")
-        trades = db.trades(mode)[-50:][::-1]
-        if trades:
-            st.dataframe(pd.DataFrame([{
-                "Cierre": fmt_ts(t["closed_at"]), "Par": t["product_id"], "Estrategia": t["strategy"],
-                "Entrada": fmt_px(t["entry_price"]), "Salida": fmt_px(t["exit_price"]),
-                "Bruto": round(t["gross_pnl"], 2), "Fees": round(t["fees"], 4),
-                "Neto": round(t["net_pnl"], 2), "Neto %": round(t["net_pct"], 2),
-                "Motivo": t["exit_reason"], "Duración": f"{t['duration_s']/60:.1f}m",
-            } for t in trades]), hide_index=True, width="stretch")
-        else:
-            st.caption("Sin trades todavía.")
-    with right:
-        st.subheader("Eventos")
-        ev = db.recent_events(40)
-        if ev:
-            st.dataframe(pd.DataFrame([{
-                "Hora": fmt_ts(e["ts"]), "Nivel": e["level"], "Cat.": e["category"], "Mensaje": e["message"],
-            } for e in ev]), hide_index=True, width="stretch", height=360)
+@app.get("/api/asset/{product_id}", dependencies=[Depends(require_auth)])
+async def asset(product_id: str) -> dict[str, Any]:
+    if product_id not in SETTINGS.pairs:
+        raise HTTPException(404, "Activo desconocido")
+    mode = db.get_kv("mode", "PAPER")
+    trades = db.trades_for(product_id, mode)
+    pos = [_position_view(p) for p in db.open_positions(mode) if p["product_id"] == product_id]
+    return {"product_id": product_id, "trades": trades, "kpis": compute_kpis(trades),
+            "position": pos[0] if pos else None,
+            "orders": [o for o in db.active_orders() if o["mode"] == mode and o["product_id"] == product_id]}
 
 
-st.title("📈 Quant Terminal — Coinbase Advanced Trade")
-live_header()
-st.divider()
-live_pairs()
-st.divider()
-live_performance()
-st.divider()
-live_positions()
-st.divider()
-live_history()
+# ═════════════════════════════════════════════════════════════════════════════
+# Velas (Coinbase pública, en caché)
+# ═════════════════════════════════════════════════════════════════════════════
+_candle_cache: dict[tuple[str, str], tuple[float, list[dict[str, Any]]]] = {}
+_candle_locks: dict[tuple[str, str], asyncio.Lock] = {}
+_http: httpx.AsyncClient | None = None
+
+
+async def _client() -> httpx.AsyncClient:
+    global _http
+    if _http is None:
+        _http = httpx.AsyncClient(timeout=10.0, headers={"User-Agent": "quant-terminal/1.0"})
+    return _http
+
+
+@app.get("/api/candles/{product_id}", dependencies=[Depends(require_auth)])
+async def candles(product_id: str, tf: str = "5m") -> dict[str, Any]:
+    if product_id not in SETTINGS.pairs or tf not in TIMEFRAMES:
+        raise HTTPException(400, "Parámetros inválidos")
+    key = (product_id, tf)
+    gran, secs = TIMEFRAMES[tf]
+    ttl = 4.0 if secs <= 300 else 15.0
+    lock = _candle_locks.setdefault(key, asyncio.Lock())
+    async with lock:
+        cached = _candle_cache.get(key)
+        if cached and time.time() - cached[0] < ttl:
+            return {"tf": tf, "seconds": secs, "candles": cached[1]}
+        end = int(time.time())
+        start = end - secs * 300
+        try:
+            client = await _client()
+            r = await client.get(COINBASE_PUBLIC.format(pid=product_id),
+                                 params={"start": start, "end": end, "granularity": gran})
+            r.raise_for_status()
+            rows = r.json().get("candles", [])
+        except Exception as exc:  # noqa: BLE001
+            if cached:
+                return {"tf": tf, "seconds": secs, "candles": cached[1], "stale": True}
+            raise HTTPException(502, f"Coinbase no disponible: {exc}") from exc
+        data = sorted(
+            ({"time": int(c["start"]), "open": float(c["open"]), "high": float(c["high"]),
+              "low": float(c["low"]), "close": float(c["close"]), "volume": float(c["volume"])} for c in rows),
+            key=lambda c: c["time"],
+        )
+        _candle_cache[key] = (time.time(), data)
+        return {"tf": tf, "seconds": secs, "candles": data}
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Comandos
+# ═════════════════════════════════════════════════════════════════════════════
+class CommandBody(BaseModel):
+    command: str
+    payload: dict[str, Any] = Field(default_factory=dict)
+    confirm: str = ""
+
+
+@app.post("/api/command", dependencies=[Depends(require_auth)])
+async def command(body: CommandBody) -> dict[str, Any]:
+    cmd = body.command.upper()
+    if cmd not in {"PANIC", "PAUSE", "RESUME", "SET_MODE"}:
+        raise HTTPException(400, "Comando no permitido")
+    if cmd == "PANIC" and body.confirm != "PANIC":
+        raise HTTPException(400, "Confirmación requerida")
+    if cmd == "SET_MODE":
+        mode = str(body.payload.get("mode", "")).upper()
+        if mode not in {"PAPER", "LIVE"}:
+            raise HTTPException(400, "Modo inválido")
+        if mode == "LIVE" and body.confirm != "LIVE":
+            raise HTTPException(400, "Escribe LIVE para confirmar")
+        body.payload = {"mode": mode}
+    cid = db.push_command(cmd, "web", body.payload)
+    return {"ok": True, "id": cid}
+
+
+@app.get("/api/commands/{cid}", dependencies=[Depends(require_auth)])
+async def command_status(cid: int) -> dict[str, Any]:
+    rows = db.query("SELECT id, command, result, processed_at FROM commands WHERE id=?", (cid,))
+    if not rows:
+        raise HTTPException(404, "No existe")
+    return rows[0]
+
+
+@app.get("/api/events", dependencies=[Depends(require_auth)])
+async def events(limit: int = 60) -> list[dict[str, Any]]:
+    return db.recent_events(min(limit, 200))
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Credenciales y portafolio
+# ═════════════════════════════════════════════════════════════════════════════
+class CredentialsBody(BaseModel):
+    api_key: str = Field(min_length=10, max_length=300)
+    api_secret: str = Field(min_length=50, max_length=5000)
+
+
+_portfolio_cache: dict[str, Any] = {}
+
+
+def _encryption_ready() -> bool:
+    return len(os.getenv("CREDENTIALS_KEY", "")) >= 16
+
+
+@app.get("/api/credentials", dependencies=[Depends(require_auth)])
+async def get_credentials() -> dict[str, Any]:
+    stored = load_credentials(db) if _encryption_ready() else None
+    return {
+        "encryption_ready": _encryption_ready(),
+        "configured": stored is not None,
+        "masked_key": stored.masked_key if stored else None,
+        "saved_at": stored.saved_at if stored else None,
+        "permissions": stored.permissions if stored else None,
+        "engine_source": db.get_kv("credentials_source", "ninguna"),
+        "live_allowed": bool(db.get_kv("live_allowed", False)),
+    }
+
+
+@app.post("/api/credentials", dependencies=[Depends(require_auth)])
+async def post_credentials(body: CredentialsBody) -> dict[str, Any]:
+    if not _encryption_ready():
+        raise HTTPException(503, "El servidor no tiene CREDENTIALS_KEY configurada")
+    try:
+        perms = await asyncio.to_thread(validate_credentials, body.api_key, body.api_secret)
+        stored = save_credentials(db, body.api_key, body.api_secret, perms)
+    except CredentialError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    db.push_command("RELOAD_CREDENTIALS", "web")
+    _portfolio_cache.clear()
+    try:
+        portfolio = await asyncio.to_thread(detect_portfolio, stored.api_key, stored.api_secret)
+        _portfolio_cache.update(data=portfolio, ts=time.time())
+    except Exception as exc:  # noqa: BLE001
+        portfolio = {"error": f"Clave válida, pero no se pudo leer el portafolio: {str(exc)[:160]}"}
+    return {"ok": True, "masked_key": stored.masked_key, "permissions": perms, "portfolio": portfolio}
+
+
+@app.delete("/api/credentials", dependencies=[Depends(require_auth)])
+async def remove_credentials() -> dict[str, Any]:
+    delete_credentials(db)
+    _portfolio_cache.clear()
+    db.push_command("RELOAD_CREDENTIALS", "web")
+    return {"ok": True}
+
+
+@app.get("/api/portfolio", dependencies=[Depends(require_auth)])
+async def portfolio(refresh: bool = False) -> dict[str, Any]:
+    stored = load_credentials(db) if _encryption_ready() else None
+    if stored is None:
+        return {"configured": False}
+    if not refresh and _portfolio_cache.get("data") and time.time() - _portfolio_cache.get("ts", 0) < 30:
+        return {"configured": True, **_portfolio_cache["data"]}
+    try:
+        data = await asyncio.to_thread(detect_portfolio, stored.api_key, stored.api_secret)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(502, f"No se pudo leer el portafolio: {str(exc)[:200]}") from exc
+    _portfolio_cache.update(data=data, ts=time.time())
+    return {"configured": True, **data}
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# SPA
+# ═════════════════════════════════════════════════════════════════════════════
+app.mount("/static", StaticFiles(directory=STATIC), name="static")
+
+
+@app.get("/")
+async def index() -> FileResponse:
+    return FileResponse(STATIC / "index.html", headers={"Cache-Control": "no-cache"})
+
+
+@app.middleware("http")
+async def security_headers(request: Request, call_next):  # type: ignore[no-untyped-def]
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "same-origin"
+    if request.url.path.startswith("/api/"):
+        response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8501")),
+                proxy_headers=True, forwarded_allow_ips="*", log_level="warning")

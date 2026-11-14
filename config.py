@@ -168,7 +168,8 @@ class StrategyConfig:
     absorption_max_range_atr: float = 0.35
 
     # OBI
-    obi_levels: int = 10
+    obi_levels: int = 10                     # mínimo de niveles por lado
+    obi_band_bps: float = _env_float("OBI_BAND_BPS", 10.0)   # banda ±0.10 % del mid
     obi_min_long: float = 0.10               # OBI mínimo para entrar en largo
     wall_multiple: float = 4.0               # nivel > 4x mediana = muro
 

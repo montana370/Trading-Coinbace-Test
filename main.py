@@ -74,6 +74,7 @@ class TradingEngine:
         self.strategy = StrategyEngine(settings.strategy, settings.fees, settings.oracle, settings.pairs)
         self.risk = RiskManager(settings.risk, settings.pairs, settings.execution.min_net_rr)
         self.notifier = TelegramNotifier(settings.creds.telegram_token, settings.creds.telegram_chat_id)
+        self.cb_key, self.cb_secret, self.creds_source = self._resolve_coinbase_creds()
         self.mode = self._initial_mode()
         self.gateway: Gateway = self._build_gateway(self.mode)
         self.execution = self._build_execution()
@@ -92,17 +93,36 @@ class TradingEngine:
     # ═════════════════════════════════════════════════════════════════════
     # Construcción
     # ═════════════════════════════════════════════════════════════════════
+    def _resolve_coinbase_creds(self) -> tuple[str, str, str]:
+        """Prioridad: clave guardada (cifrada) desde la plataforma web → variables de entorno."""
+        try:
+            from credentials import load_credentials
+
+            stored = load_credentials(self.db.sync)
+        except Exception:  # noqa: BLE001
+            stored = None
+        if stored:
+            return stored.api_key, stored.api_secret, "plataforma"
+        c = self.s.creds
+        if c.has_coinbase:
+            return c.coinbase_api_key, c.coinbase_api_secret, "entorno"
+        return "", "", "ninguna"
+
+    @property
+    def has_coinbase(self) -> bool:
+        return bool(self.cb_key and self.cb_secret)
+
     def _initial_mode(self) -> str:
         override = self.db.sync.get_kv("mode_override")
         mode = (override or self.s.runtime.mode).upper()
-        if mode == "LIVE" and not (self.s.runtime.allow_live and self.s.creds.has_coinbase):
+        if mode == "LIVE" and not (self.s.runtime.allow_live and self.has_coinbase):
             log.warning("LIVE solicitado sin ALLOW_LIVE_TRADING=true o sin credenciales → PAPER")
             mode = "PAPER"
         return mode
 
     def _build_gateway(self, mode: str) -> Gateway:
         if mode == "LIVE":
-            return CoinbaseGateway(self.s.creds.coinbase_api_key, self.s.creds.coinbase_api_secret)
+            return CoinbaseGateway(self.cb_key, self.cb_secret)
         gw = PaperGateway(
             self.markets, self.s.runtime.paper_starting_equity,
             self.s.fees.maker_fee, self.s.fees.taker_fee,
@@ -217,8 +237,7 @@ class TradingEngine:
     # WebSockets (hilo del SDK → event loop del motor)
     # ═════════════════════════════════════════════════════════════════════
     def _ws_keys(self) -> tuple[str | None, str | None]:
-        c = self.s.creds
-        return (c.coinbase_api_key, c.coinbase_api_secret) if c.has_coinbase else (None, None)
+        return (self.cb_key, self.cb_secret) if self.has_coinbase else (None, None)
 
     def _make_client(self, conn: WSConn) -> Any:
         from coinbase.websocket import WSClient, WSUserClient
@@ -273,7 +292,7 @@ class TradingEngine:
 
     def _start_market_ws(self) -> None:
         products = list(self.s.pairs)
-        auth = self.s.creds.has_coinbase
+        auth = False   # canales de mercado públicos: no dependen de la clave
         # level2 en conexión dedicada (alto volumen) para aislar el resto de canales
         self.conns["l2"] = WSConn("l2", ["level2"], products, authenticated=auth)
         self.conns["flow"] = WSConn("flow", ["market_trades", "ticker"], products, authenticated=auth)
@@ -328,6 +347,8 @@ class TradingEngine:
             books = " ".join(
                 f"{pid.split('-')[0]}={'OK' if mk.book.initialized else 'NO'}"
                 f"({len(mk.book.bids)}/{len(mk.book.asks)}) tr={len(mk.trades)}"
+                f" sp={mk.book.spread_pct if mk.book.spread_pct is None else round(mk.book.spread_pct, 4)}"
+                f" obi={self.strategy.analytics[pid].obi:+.2f} {self.strategy.analytics[pid].regime.value}"
                 for pid, mk in self.markets.items()
             )
             log.info("[DIAG] %s || %s", conns, books)
@@ -465,7 +486,7 @@ class TradingEngine:
         if a.regime is not sig.regime:
             return False, f"régimen cambió a {a.regime.value}"
         mk = self.markets[sig.product_id]
-        obi = mk.book.obi(self.s.strategy.obi_levels)
+        obi = mk.book.obi_band(self.s.strategy.obi_band_bps, self.s.strategy.obi_levels)
         if obi < self.s.strategy.obi_min_long:
             return False, f"OBI {obi:+.2f}"
         sp = mk.book.spread_pct
@@ -566,6 +587,8 @@ class TradingEngine:
             self.notifier.notify_text(f"{'▶️' if ok else '⛔'} <b>RESUME</b> ({src}): {msg}", critical=True)
             await self._event("INFO" if ok else "WARN", "CONTROL", f"RESUME ({src}): {msg}")
             return ("OK: " if ok else "RECHAZADO: ") + msg
+        if cmd == CommandType.RELOAD_CREDENTIALS.value:
+            return await self._reload_credentials(src)
         if cmd == CommandType.SET_MODE.value:
             return await self._switch_mode(str(c["payload"].get("mode", "")).upper(), src)
         return f"Desconocido: {cmd}"
@@ -590,6 +613,35 @@ class TradingEngine:
         await self._event("CRITICAL", "KILL_SWITCH", f"{reason} → {summary}")
         return f"OK: {summary}"
 
+    async def _reload_credentials(self, src: str) -> str:
+        key, secret, source = await asyncio.to_thread(self._resolve_coinbase_creds)
+        if (key, secret) == (self.cb_key, self.cb_secret):
+            return f"Sin cambios (origen: {source})"
+        if self.mode == "LIVE" and (self.execution.positions or self.execution.pending_products):
+            return "RECHAZADO: en LIVE con posiciones abiertas no se puede cambiar de clave"
+        self.cb_key, self.cb_secret, self.creds_source = key, secret, source
+        if self.mode == "LIVE":
+            if not self.has_coinbase:
+                # sin clave no se puede operar en real: volver a PAPER
+                self.mode = "PAPER"
+                await asyncio.to_thread(self._stop_user_ws)
+                self.gateway = self._build_gateway("PAPER")
+                await self._load_market_metadata()
+                self.execution = self._build_execution()
+                await self.execution.restore()
+                await self.db.run(self.db.sync.set_kv, "mode_override", "PAPER")
+            else:
+                self.gateway = self._build_gateway("LIVE")
+                await self._load_market_metadata()
+                self.execution = self._build_execution()
+                await self.execution.restore()
+                await self._refresh_fee_rates()
+                await asyncio.to_thread(self._stop_user_ws)
+                await asyncio.to_thread(self._start_user_ws)
+        await self._event("WARN", "CREDENTIALS", f"Credenciales recargadas ({src}) · origen {source}")
+        self.notifier.notify_text(f"🔑 Credenciales de Coinbase actualizadas ({source})", critical=True)
+        return f"OK: credenciales recargadas (origen: {source})"
+
     async def _switch_mode(self, new_mode: str, src: str) -> str:
         if new_mode not in ("PAPER", "LIVE"):
             return "RECHAZADO: modo inválido"
@@ -597,7 +649,7 @@ class TradingEngine:
             return f"Sin cambios ({new_mode})"
         if self.execution.positions or self.execution.pending_products:
             return "RECHAZADO: cierra posiciones/entradas antes de cambiar de modo"
-        if new_mode == "LIVE" and not (self.s.runtime.allow_live and self.s.creds.has_coinbase):
+        if new_mode == "LIVE" and not (self.s.runtime.allow_live and self.has_coinbase):
             return "RECHAZADO: LIVE requiere ALLOW_LIVE_TRADING=true y credenciales CDP"
         old_gateway = self.gateway
         if isinstance(old_gateway, PaperGateway):
@@ -751,6 +803,9 @@ class TradingEngine:
             "consecutive_losses": self.risk.state.consecutive_losses,
             "open_positions": len(self.execution.positions),
             "max_open_positions": self.s.risk.max_open_positions,
+            "credentials_source": self.creds_source,
+            "live_allowed": self.s.runtime.allow_live,
+            "universe": list(self.s.pairs),
         }
 
         def write() -> None:

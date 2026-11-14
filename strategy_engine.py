@@ -140,9 +140,10 @@ class OracleState:
 
 
 class BTCOracle:
-    def __init__(self, cfg: OracleConfig, obi_levels: int) -> None:
+    def __init__(self, cfg: OracleConfig, obi_levels: int, obi_band_bps: float = 10.0) -> None:
         self.cfg = cfg
         self.obi_levels = obi_levels
+        self.obi_band_bps = obi_band_bps
         self.state = OracleState()
 
     def update(self, btc: MarketState) -> tuple[OracleState, bool]:
@@ -151,7 +152,7 @@ class BTCOracle:
         chg = btc.price_change_pct(c.window_s)
         delta, vol = btc.cvd_window(c.window_s)
         cvd_ratio = delta / vol if vol > 0 else 0.0
-        obi = btc.book.obi(self.obi_levels) if btc.book.initialized else 0.0
+        obi = btc.book.obi_band(self.obi_band_bps, self.obi_levels) if btc.book.initialized else 0.0
         reasons: list[str] = []
         if chg <= -c.max_drop_pct:
             reasons.append(f"caída 5m {chg:.2f}%")
@@ -187,7 +188,7 @@ class StrategyEngine:
         self.fees = fcfg
         self.pairs = pairs
         self.regime = RegimeDetector(scfg)
-        self.oracle = BTCOracle(ocfg, scfg.obi_levels)
+        self.oracle = BTCOracle(ocfg, scfg.obi_levels, scfg.obi_band_bps)
         self.maker_fee = fcfg.maker_fee
         self.taker_fee = fcfg.taker_fee
         self.analytics: dict[str, PairAnalytics] = {p: PairAnalytics(p) for p in pairs}
@@ -206,7 +207,7 @@ class StrategyEngine:
         a.best_ask = mk.book.best_ask or float("nan")
         a.price = mk.book.mid or mk.last_price
         a.spread_pct = mk.book.spread_pct if mk.book.spread_pct is not None else float("nan")
-        a.obi = mk.book.obi(c.obi_levels) if mk.book.initialized else 0.0
+        a.obi = mk.book.obi_band(c.obi_band_bps, c.obi_levels) if mk.book.initialized else 0.0
         a.vwap = mk.vwap.vwap
         a.vwap_sigma = mk.vwap.sigma
         delta, vol = mk.cvd_window(c.cvd_window_s)

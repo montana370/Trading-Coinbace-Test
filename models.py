@@ -37,6 +37,7 @@ class CommandType(str, Enum):
     PAUSE = "PAUSE"
     RESUME = "RESUME"
     SET_MODE = "SET_MODE"
+    RELOAD_CREDENTIALS = "RELOAD_CREDENTIALS"
 
 
 class OrderStatus(str, Enum):

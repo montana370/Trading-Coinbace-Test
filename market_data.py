@@ -117,6 +117,26 @@ class OrderBook:
             np.array([s for _, s in bids], dtype=float), np.array([s for _, s in asks], dtype=float)
         )
 
+    def obi_band(self, band_bps: float, min_levels: int = 5) -> float:
+        """
+        OBI sobre la profundidad dentro de ±band_bps del mid (comparable entre
+        activos con ticks muy distintos). Si la banda contiene menos de
+        `min_levels` niveles por lado, se usan los `min_levels` mejores.
+        """
+        mid = self.mid
+        if mid is None:
+            return 0.0
+        lo, hi = mid * (1 - band_bps / 10_000), mid * (1 + band_bps / 10_000)
+        bids = [q for p, q in self.bids.items() if p >= lo]
+        asks = [q for p, q in self.asks.items() if p <= hi]
+        if len(bids) < min_levels or len(asks) < min_levels:
+            tb, ta = self.top(min_levels)
+            if len(bids) < min_levels:
+                bids = [q for _, q in tb]
+            if len(asks) < min_levels:
+                asks = [q for _, q in ta]
+        return order_book_imbalance(np.array(bids, dtype=float), np.array(asks, dtype=float))
+
     def ask_walls(self, levels: int, multiple: float) -> list[tuple[float, float]]:
         """Niveles de venta con tamaño > multiple × mediana (zonas de liquidez)."""
         _, asks = self.top(levels)

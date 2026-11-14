@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Arranca Core Engine + Dashboard en el mismo contenedor (comparten el volumen SQLite).
+# Arranca Core Engine + Plataforma web en el mismo contenedor (comparten el volumen SQLite).
 # Si cualquiera de los dos termina, el contenedor sale y Railway lo reinicia.
 set -uo pipefail
 
@@ -10,13 +10,15 @@ if [[ -n "${RAILWAY_ENVIRONMENT:-}" && -z "${DASHBOARD_PASSWORD:-}" ]]; then
   echo "ERROR: DASHBOARD_PASSWORD es obligatoria en Railway (el dashboard es público y tiene Kill-Switch)." >&2
   exit 1
 fi
+CK="${CREDENTIALS_KEY:-}"
+if [[ -n "${RAILWAY_ENVIRONMENT:-}" && ${#CK} -lt 16 ]]; then
+  echo "AVISO: CREDENTIALS_KEY no definida: no se podrán guardar claves API desde la plataforma." >&2
+fi
 
 python main.py &
 ENGINE=$!
 
-streamlit run dashboard.py \
-  --server.port "${PORT:-8501}" --server.address 0.0.0.0 \
-  --server.headless true --browser.gatherUsageStats false &
+python dashboard.py &
 UI=$!
 
 shutdown() {

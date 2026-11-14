@@ -138,7 +138,7 @@ CREATE TABLE IF NOT EXISTS events (
 CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts);
 """
 
-COMMAND_PRIORITY = {"PANIC": 100, "PAUSE": 50, "SET_MODE": 20, "RESUME": 10}
+COMMAND_PRIORITY = {"PANIC": 100, "PAUSE": 50, "RELOAD_CREDENTIALS": 30, "SET_MODE": 20, "RESUME": 10}
 
 
 class Database:
@@ -158,6 +158,15 @@ class Database:
         self._conn.execute("PRAGMA temp_store=MEMORY;")
         if not readonly:
             self._conn.executescript(SCHEMA)
+            self._migrate()
+
+    def _migrate(self) -> None:
+        """Migraciones aditivas e idempotentes."""
+        cols = {r[1] for r in self._conn.execute("PRAGMA table_info(trades)").fetchall()}
+        for col in ("initial_stop", "take_profit"):
+            if col not in cols:
+                self._conn.execute(f"ALTER TABLE trades ADD COLUMN {col} REAL")
+        self._conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_product ON trades(product_id, closed_at)")
 
     # ── utilidades básicas ──────────────────────────────────────────────────
     def execute(self, sql: str, params: Iterable[Any] = ()) -> None:
@@ -261,6 +270,12 @@ class Database:
         self.execute(
             f"INSERT OR REPLACE INTO trades({','.join(cols)}) VALUES({','.join('?' for _ in cols)})",
             [row[c] for c in cols],
+        )
+
+    def trades_for(self, product_id: str, mode: str, limit: int = 200) -> list[dict[str, Any]]:
+        return self.query(
+            "SELECT * FROM trades WHERE product_id=? AND mode=? ORDER BY closed_at DESC LIMIT ?",
+            (product_id, mode, limit),
         )
 
     def trades(self, mode: str | None = None, since: float = 0.0) -> list[dict[str, Any]]:

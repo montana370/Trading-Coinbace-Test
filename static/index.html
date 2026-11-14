@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#0b0e13" media="(prefers-color-scheme: dark)">
+  <meta name="theme-color" content="#f6f7f9" media="(prefers-color-scheme: light)">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <title>Quant Terminal</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/app.css?v=4">
+  <script src="/static/vendor/lightweight-charts.standalone.production.js" defer></script>
+  <script src="/static/app.js?v=4" defer></script>
+</head>
+<body>
+  <!-- ═══ Login ═══ -->
+  <section id="login" class="login" hidden>
+    <div class="login-card">
+      <div class="brand"><span class="brand-mark">◆</span> Quant Terminal</div>
+      <p class="muted">Coinbase Advanced Trade · Auto-Trading</p>
+      <form id="login-form" autocomplete="on">
+        <label for="login-pass">Contraseña</label>
+        <input id="login-pass" type="password" autocomplete="current-password" required>
+        <button class="btn btn-primary btn-block" type="submit">Entrar</button>
+        <p id="login-error" class="error-text" role="alert"></p>
+      </form>
+    </div>
+  </section>
+
+  <!-- ═══ App ═══ -->
+  <div id="app" hidden>
+    <header class="topbar">
+      <div class="topbar-left">
+        <span class="brand-mark">◆</span>
+        <span id="tb-status" class="pill">—</span>
+        <span id="tb-mode" class="pill pill-ghost">—</span>
+      </div>
+      <div class="topbar-right mono">
+        <span title="Latencia WebSocket"><i class="dot" id="tb-dot"></i><span id="tb-ws">—</span></span>
+        <span class="muted" title="Latencia API"><span id="tb-api">—</span></span>
+      </div>
+    </header>
+    <div id="offline-banner" class="banner banner-danger" hidden>⚠️ El Core Engine no responde. Los datos pueden estar desactualizados.</div>
+
+    <main id="view-home" class="view"></main>
+    <main id="view-asset" class="view" hidden></main>
+    <main id="view-portfolio" class="view" hidden></main>
+    <main id="view-settings" class="view" hidden></main>
+
+    <nav class="tabbar" aria-label="Navegación">
+      <a href="#home" data-tab="home" class="tab"><svg viewBox="0 0 24 24"><path d="M3 11l9-7 9 7v9a1 1 0 0 1-1 1h-5v-6H9v6H4a1 1 0 0 1-1-1z"/></svg><span>Inicio</span></a>
+      <a href="#asset" data-tab="asset" class="tab"><svg viewBox="0 0 24 24"><path d="M4 19V9m5 10V5m5 14v-7m5 7V8"/></svg><span>Activos</span></a>
+      <a href="#portfolio" data-tab="portfolio" class="tab"><svg viewBox="0 0 24 24"><path d="M3 7h18v12H3zM8 7V5h8v2M3 12h18"/></svg><span>Portafolio</span></a>
+      <a href="#settings" data-tab="settings" class="tab"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg><span>Ajustes</span></a>
+    </nav>
+  </div>
+
+  <!-- ═══ Bottom sheet ═══ -->
+  <div id="sheet-backdrop" class="sheet-backdrop" hidden></div>
+  <div id="sheet" class="sheet" role="dialog" aria-modal="true" hidden></div>
+  <div id="toast" class="toast" role="status" hidden></div>
+</body>
+</html>

@@ -547,6 +547,8 @@ class ExecutionHandler:
             "duration_s": time.time() - pos.opened_at,
             "exit_reason": reason,
             "mode": self.mode,
+            "initial_stop": pos.initial_stop,
+            "take_profit": pos.take_profit,
         }
         self.closed_trades_cache.append(trade)
         await self.db.run(self.db.sync.insert_trade, trade)

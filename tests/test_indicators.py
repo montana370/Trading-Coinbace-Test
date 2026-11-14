@@ -36,3 +36,16 @@ def test_atr_rsi_adx_shapes_and_ranges():
 def test_obi():
     assert ind.order_book_imbalance(np.array([3.0]), np.array([1.0])) == 0.5
     assert ind.order_book_imbalance(np.array([]), np.array([])) == 0.0
+
+
+def test_obi_band_uses_price_band_not_level_count():
+    from market_data import OrderBook
+
+    b = OrderBook("BTC-USDC")
+    ups = []
+    # ticks de 0.01: 10 niveles de bid finos pegados al mid, ask grueso dentro de la banda
+    for i in range(1, 400):
+        ups.append({"side": "bid", "price_level": f"{100_000 - i * 0.01:.2f}", "new_quantity": "0.5"})
+        ups.append({"side": "offer", "price_level": f"{100_000 + i * 0.01:.2f}", "new_quantity": "0.5"})
+    b.apply_snapshot(ups)
+    assert abs(b.obi_band(10.0)) < 0.01      # libro simétrico ⇒ OBI ≈ 0
