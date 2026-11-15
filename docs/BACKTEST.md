@@ -73,3 +73,33 @@ Mismo sistema de tendencia que en la sección 2, simétrico (cortos en rupturas 
 
 Limitaciones: el periodo de prueba es mayormente bajista (los cortos ayudan); no modela el límite de
 2 posiciones simultáneas, el deslizamiento real ni la liquidez de SUI (volumen bajo).
+
+## 4. ¿Operar todos los días? Intradía y más mercados (perpetuos)
+
+### 4.1 Estrategias intradía (`research_intraday.py`)
+1 h (4 años) y 15 min (1,5 años), largo y corto, comisiones de perpetuos, 60 % entrenamiento / 40 % prueba.
+
+| Estrategia | Combinaciones positivas fuera de muestra | Mejor combinación en prueba |
+|---|---|---|
+| Ruptura 1 h | 9 / 18 (azar) | pierde en 3 de 4 pares, DD 20,6 % |
+| Reversión 1 h (RSI2 + Bollinger) | 0 / 16 | pierde |
+| Ruptura 15 min | 0 / 18 | pierde en 3 de 4 pares, DD 31,5 % |
+| Reversión 15 min | 0 / 16 | pierde |
+
+**Conclusión:** no hay ventaja intradía demostrable en estas familias, ni siquiera con comisiones de perpetuos.
+
+### 4.2 Más mercados con el sistema 6 h (`research_portfolio.py`)
+Por mercado y por separado, 15 de 18 perpetuos adicionales son positivos con parámetros fijos. **Pero
+como cartera con capital compartido** (22 mercados, sin descartar perdedores) el resultado es ≈ 0 %
+con caídas del 12-28 %: las altcoins están muy correlacionadas y añaden ruido, no ventaja.
+
+| Cartera | 4 años | Últimos 2 años | Máx. DD | Operaciones/día |
+|---|---|---|---|---|
+| 22 mercados, 0,5 % riesgo, máx. 6 posiciones | +3,2 % | −3,2 % | 15,3 % | 1,0 |
+| 22 mercados, 0,35 % riesgo, máx. 12 posiciones | −1,0 % | +0,7 % | 17,4 % | 1,6 |
+| **4 pares, 1 % riesgo, máx. 2 posiciones** (desplegado) | +47,9 % | **+12,2 %** | 14,0 % | 0,3 |
+| **4 pares, 0,5 % riesgo, máx. 4 posiciones** | +46,8 % | **+15,1 %** | **10,6 %** | 0,44 |
+
+**Conclusión:** la mejor configuración con evidencia es la cartera de 4 pares principales con 0,5 % de
+riesgo y hasta 4 posiciones (mismo riesgo total, menor caída, ~3 operaciones por semana). Operar a
+diario con ventaja no está respaldado por los datos.

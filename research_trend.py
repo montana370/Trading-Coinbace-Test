@@ -49,8 +49,12 @@ def fetch(pid: str, gran: str, secs: int, years: float) -> dict[str, np.ndarray]
         cur = start
         while cur < end:
             ce = min(cur + 300 * secs, end)
-            for attempt in range(6):
-                r = c.get(URL.format(pid=pid), params={"start": cur, "end": ce, "granularity": gran})
+            for attempt in range(8):
+                try:
+                    r = c.get(URL.format(pid=pid), params={"start": cur, "end": ce, "granularity": gran})
+                except httpx.HTTPError:
+                    time.sleep(2 ** min(attempt, 4))
+                    continue
                 if r.status_code == 429:
                     time.sleep(2 ** attempt)
                     continue
