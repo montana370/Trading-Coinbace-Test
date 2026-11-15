@@ -47,3 +47,29 @@ largos, 1 % de riesgo por operación. ~4 años de datos; parámetros elegidos so
 **Lectura honesta:** el seguimiento de tendencia protege el capital en mercados bajistas y captura
 parte de las tendencias alcistas, pero no hay evidencia de beneficio en cualquier mercado. Con 1 % de
 riesgo por operación los rendimientos son modestos.
+
+## 3. Perpetuos US de Coinbase (largo y corto)
+
+Mercados (Coinbase Financial Markets, regulado por la CFTC): `BIP-20DEC30-CDE` (BTC, 0,01 BTC),
+`ETP-20DEC30-CDE` (ETH, 0,1 ETH), `SLP-20DEC30-CDE` (SOL, 5 SOL), `SUP-20DEC30-CDE` (SUI, 500 SUI).
+
+Supuestos conservadores (`research_perps.py`): maker 0,02 %, taker 0,05 %, financiación 0,01 % cada
+8 h cobrada siempre (también a los cortos), apalancamiento máx. 2×, 1 % de riesgo por operación.
+Precio: spot de Coinbase como aproximación del perpetuo.
+
+Mismo sistema de tendencia que en la sección 2, simétrico (cortos en rupturas bajistas bajo la EMA 200).
+
+| 6 h, fuera de muestra (2024-26) | SOL | BTC | ETH | SUI |
+|---|---|---|---|---|
+| Largo y corto | **+9,6 %** | **+14,5 %** | **+16,1 %** | **+4,9 %** |
+| Solo largo (comisiones de perpetuos) | +7,6 % | +6,5 % | +4,0 % | +6,0 % |
+| Solo largo (comisiones spot, sección 2) | +2,8 % | −0,2 % | −2,5 % | +1,9 % |
+| Comprar y mantener | −66,6 % | −26,6 % | −42,2 % | −80,4 % |
+
+- Unas 75-85 operaciones por par en 2 años (~3 al mes), con drawdown máximo de 5-7 %.
+- Robustez: **18 de 18** combinaciones de parámetros tienen media positiva fuera de muestra y en
+  **12 de 18** los cuatro pares son positivos.
+- Parámetros elegidos en entrenamiento: N = 20, M = 10, k = 2,5·ATR.
+
+Limitaciones: el periodo de prueba es mayormente bajista (los cortos ayudan); no modela el límite de
+2 posiciones simultáneas, el deslizamiento real ni la liquidez de SUI (volumen bajo).
