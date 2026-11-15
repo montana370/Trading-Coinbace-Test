@@ -91,8 +91,8 @@ class PairConfig:
 ORACLE_PRODUCT = "BTC-USDC"
 
 # Spread máx: en spot el precalibrado original; en perpetuos el libro es más ancho
-# (tick de $5 en BTC) y el límite se adapta a lo observado (~0.03 % BTC, ~0.11 % SUI).
-_SPREAD = {"SOL-USDC": (0.04, 0.10), "BTC-USDC": (0.02, 0.06), "ETH-USDC": (0.03, 0.08), "SUI-USDC": (0.06, 0.20)}
+# y el límite se adapta a lo observado en vivo (BTC ~0.03 %, ETH/SOL 0.07-0.11 %, SUI ~0.11 %).
+_SPREAD = {"SOL-USDC": (0.04, 0.15), "BTC-USDC": (0.02, 0.06), "ETH-USDC": (0.03, 0.15), "SUI-USDC": (0.06, 0.25)}
 PAIRS: dict[str, PairConfig] = {
     pid: PairConfig(pid, role, alloc, _SPREAD[pid][1 if IS_PERPS else 0], trend, mr,
                     PERP_PRODUCTS[pid] if IS_PERPS else pid)
