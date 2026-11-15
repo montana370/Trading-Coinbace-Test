@@ -58,6 +58,8 @@ class PairAnalytics:
     trend_ema: float = float("nan")            # EMA 200 en 6 h
     trend_exit_level: float = float("nan")     # mínimo de M velas 6 h (salida de canal)
     trend_atr: float = float("nan")            # ATR(14) en 6 h
+    trend_short_entry_level: float = float("nan")   # mínimo de N velas (ruptura bajista)
+    trend_short_exit_level: float = float("nan")    # máximo de M velas (salida de cortos)
     signal_state: str = "WARMUP"
     ts: float = field(default_factory=time.time)
 
@@ -372,6 +374,7 @@ class StrategyEngine:
         st, new_bar = self.trend.update(mk)
         a.trend_entry_level, a.trend_ema, a.trend_exit_level, a.trend_atr = (
             st.entry_level, st.ema, st.exit_level, st.atr)
+        a.trend_short_entry_level, a.trend_short_exit_level = st.short_entry_level, st.short_exit_level
         a.fee_ok, a.fee_reason = True, "N/A (tendencia sin TP fijo)"
         if not st.ready:
             a.signal_state = "TREND_6H: calentando (faltan velas 6 h)"

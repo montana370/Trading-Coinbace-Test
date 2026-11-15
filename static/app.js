@@ -299,7 +299,11 @@ function renderAssetDetail(p) {
     ${p.trend_entry_level != null ? `
     <div class="kv"><span>Nivel de ruptura (máx. 20×6h)</span><span>${fpx(pid, p.trend_entry_level)} (${fpct((p.trend_entry_level - p.price) / p.price * 100)})</span></div>
     <div class="kv"><span>EMA 200 (6h)</span><span class="${p.price > p.trend_ema ? "up" : "down"}">${fpx(pid, p.trend_ema)}</span></div>
-    <div class="kv"><span>Salida de canal (mín. 20×6h)</span><span>${fpx(pid, p.trend_exit_level)}</span></div>
+    ${S.data.telemetry.venue === "PERPS" && p.trend_short_entry_level != null ? `
+    <div class="kv"><span>Ruptura bajista (mín. 20×6h)</span><span>${fpx(pid, p.trend_short_entry_level)} (${fpct((p.trend_short_entry_level - p.price) / p.price * 100)})</span></div>` : ""}
+    <div class="kv"><span>Salida de largos (mín. canal)</span><span>${fpx(pid, p.trend_exit_level)}</span></div>
+    ${S.data.telemetry.venue === "PERPS" && p.trend_short_exit_level != null ? `
+    <div class="kv"><span>Salida de cortos (máx. canal)</span><span>${fpx(pid, p.trend_short_exit_level)}</span></div>` : ""}
     <div class="kv"><span>ATR (6h)</span><span>${fpx(pid, p.trend_atr)}</span></div>` : `
     <div class="kv"><span>Recorrido proyectado</span><span>${p.projected_move_pct != null ? p.projected_move_pct.toFixed(2) + "%" : "—"}</span></div>
     <div class="kv"><span>Filtro comisiones</span><span class="${p.fee_filter_ok ? "up" : "down"}">${p.fee_filter_ok ? "PASA" : "BLOQUEA"}</span></div>`}
@@ -400,10 +404,14 @@ function applyOverlays() {
     }
     const pr = S.data && S.data.pairs.find((x) => x.product_id === pid);
     if (pr && pr.trend_entry_level != null && !p) {
-      line(pr.trend_entry_level, css("--accent"), "Ruptura 6h", 3);
+      line(pr.trend_entry_level, css("--accent"), "Ruptura ↑ 6h", 3);
+      if (S.data.telemetry.venue === "PERPS" && pr.trend_short_entry_level != null) line(pr.trend_short_entry_level, css("--warn"), "Ruptura ↓ 6h", 3);
       line(pr.trend_ema, css("--violet"), "EMA200", 3);
     }
-    if (pr && pr.trend_exit_level != null && p && isTrend(p)) line(pr.trend_exit_level, css("--warn"), "Salida canal", 3);
+    if (pr && p && isTrend(p)) {
+      const lvl = p.side === "SELL" ? pr.trend_short_exit_level : pr.trend_exit_level;
+      if (lvl != null) line(lvl, css("--warn"), "Salida canal", 3);
+    }
     const sel = a.trades.find((t) => t.trade_id === S.selectedTrade);
     if (sel) {
       line(sel.entry_price, css("--accent"), "Entrada", 1);

@@ -886,6 +886,8 @@ class TradingEngine:
                 "fee_filter_reason": a.fee_reason, "signal": a.signal_state, "updated_at": a.ts,
                 "trend_entry_level": _nn(a.trend_entry_level), "trend_ema": _nn(a.trend_ema),
                 "trend_exit_level": _nn(a.trend_exit_level), "trend_atr": _nn(a.trend_atr),
+                "trend_short_entry_level": _nn(a.trend_short_entry_level),
+                "trend_short_exit_level": _nn(a.trend_short_exit_level),
             })
         o = self.strategy.oracle.state
         connected, hb_age = self._market_conns_ok()

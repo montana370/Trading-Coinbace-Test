@@ -170,7 +170,8 @@ class Database:
         if "side" not in poscols:
             self._conn.execute("ALTER TABLE positions ADD COLUMN side TEXT")
         pcols = {r[1] for r in self._conn.execute("PRAGMA table_info(pair_snapshot)").fetchall()}
-        for col in ("trend_entry_level", "trend_ema", "trend_exit_level", "trend_atr"):
+        for col in ("trend_entry_level", "trend_ema", "trend_exit_level", "trend_atr",
+                    "trend_short_entry_level", "trend_short_exit_level"):
             if col not in pcols:
                 self._conn.execute(f"ALTER TABLE pair_snapshot ADD COLUMN {col} REAL")
         self._conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_product ON trades(product_id, closed_at)")
