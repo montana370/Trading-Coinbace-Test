@@ -163,9 +163,12 @@ class Database:
     def _migrate(self) -> None:
         """Migraciones aditivas e idempotentes."""
         cols = {r[1] for r in self._conn.execute("PRAGMA table_info(trades)").fetchall()}
-        for col in ("initial_stop", "take_profit"):
+        for col, typ in (("initial_stop", "REAL"), ("take_profit", "REAL"), ("side", "TEXT"), ("funding", "REAL")):
             if col not in cols:
-                self._conn.execute(f"ALTER TABLE trades ADD COLUMN {col} REAL")
+                self._conn.execute(f"ALTER TABLE trades ADD COLUMN {col} {typ}")
+        poscols = {r[1] for r in self._conn.execute("PRAGMA table_info(positions)").fetchall()}
+        if "side" not in poscols:
+            self._conn.execute("ALTER TABLE positions ADD COLUMN side TEXT")
         pcols = {r[1] for r in self._conn.execute("PRAGMA table_info(pair_snapshot)").fetchall()}
         for col in ("trend_entry_level", "trend_ema", "trend_exit_level", "trend_atr"):
             if col not in pcols:

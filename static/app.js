@@ -98,7 +98,7 @@ function renderTopbar() {
   const st = alive ? (t.bot_status || "—") : "OFFLINE";
   const pc = { RUNNING: "pill-up", PAUSED: "pill-warn", SAFE: "pill-warn", KILLED: "pill-down" }[st] || "pill-down";
   const s = $("#tb-status"); s.className = `pill ${pc}`; s.textContent = st;
-  const m = $("#tb-mode"); m.textContent = t.mode || "—"; m.className = `pill ${t.mode === "LIVE" ? "pill-down" : "pill-ghost"}`;
+  const m = $("#tb-mode"); m.textContent = (t.mode || "—") + (t.venue === "PERPS" ? ` · PERPS ${t.max_leverage || 2}×` : ""); m.className = `pill ${t.mode === "LIVE" ? "pill-down" : "pill-ghost"}`;
   $("#tb-ws").textContent = t.ws_latency_ms != null ? `${Math.round(t.ws_latency_ms)}ms` : "—";
   $("#tb-api").textContent = t.api_latency_ms != null ? `API ${Math.round(t.api_latency_ms)}ms` : "";
   $("#tb-dot").className = "dot " + (alive && t.ws_connected ? "ok" : "bad");
@@ -180,11 +180,12 @@ function assetRow(p) {
 
 const isTrend = (p) => p.strategy === "TREND_6H";
 function positionCard(p) {
-  const trend = isTrend(p);
-  const top = trend ? Math.max(p.mark_price, p.entry_price) * 1.08 : p.take_profit;
-  const pid = p.product_id, lo = Math.min(p.stop_price, p.mark_price), hi = Math.max(top, p.mark_price);
+  const trend = isTrend(p), short = p.side === "SELL";
+  const top = trend ? (short ? Math.min(p.mark_price, p.entry_price) * 0.92 : Math.max(p.mark_price, p.entry_price) * 1.08) : p.take_profit;
+  const pid = p.product_id;
+  const lo = Math.min(p.stop_price, p.mark_price, top), hi = Math.max(p.stop_price, top, p.mark_price);
   const pos = (v) => Math.max(0, Math.min(100, ((v - lo) / (hi - lo || 1)) * 100));
-  return `<div class="card"><div class="pos-head"><div class="row" style="gap:10px">${coin(pid)}<div><div style="font-weight:600">${esc(base(pid))} · LONG</div>
+  return `<div class="card"><div class="pos-head"><div class="row" style="gap:10px">${coin(pid)}<div><div style="font-weight:600">${esc(base(pid))} · ${p.side === "SELL" ? `<span class="down">CORTO</span>` : `<span class="up">LARGO</span>`}</div>
       <div class="faint" style="font-size:12px">${esc(p.strategy)} · ${dt(p.opened_at)}</div></div></div>
       <div style="text-align:right"><div class="pos-pnl ${cls(p.unrealized_net)}">${fsign(p.unrealized_net)}</div><div class="faint" style="font-size:11px">PnL neto flotante</div></div></div>
     <div class="range"><b style="left:${pos(p.stop_price)}%;background:var(--down)"></b><b style="left:${pos(p.entry_price)}%;background:var(--accent)"></b>
@@ -192,8 +193,8 @@ function positionCard(p) {
       <em style="left:${pos(p.stop_price)}%">${trend ? "Trailing" : "SL"}</em>${Math.min(Math.abs(pos(p.entry_price) - pos(p.stop_price)), Math.abs(pos(top) - pos(p.entry_price))) > 18 ? `<em style="left:${pos(p.entry_price)}%">Entrada</em>` : ""}${trend ? "" : `<em style="left:${pos(p.take_profit)}%">TP</em>`}</div>
     <div class="kv"><span>Entrada · Tamaño</span><span>${fpx(pid, p.entry_price)} · ${Number(p.size).toPrecision(6)}</span></div>
     <div class="kv"><span>Precio actual</span><span>${fpx(pid, p.mark_price)}</span></div>
-    <div class="kv"><span>${trend ? "Stop (trailing)" : "Stop Loss"}</span><span class="down">${fpx(pid, p.stop_price)} (${fpct(-p.dist_sl_pct)})</span></div>
-    ${trend ? `<div class="kv"><span>Salida</span><span>trailing 5×ATR(6h) o cierre bajo el canal</span></div>`
+    <div class="kv"><span>${trend ? "Stop (trailing)" : "Stop Loss"}</span><span class="down">${fpx(pid, p.stop_price)} (${fpct(short ? p.dist_sl_pct : -p.dist_sl_pct)})</span></div>
+    ${trend ? `<div class="kv"><span>Salida</span><span>trailing por ATR (6h) o cierre fuera del canal</span></div>`
       : `<div class="kv"><span>Take Profit</span><span class="up">${fpx(pid, p.take_profit)} (${fpct(p.dist_tp_pct)})</span></div>`}
     <div class="kv"><span>Breakeven (fees)</span><span>${fpx(pid, p.breakeven_price)} ${p.breakeven_armed ? "🛡️" : ""}</span></div></div>`;
 }
@@ -262,7 +263,7 @@ function renderAsset(full) {
             <div class="tf-bar">${TFS.map((t) => `<button class="tf ${t === S.tf ? "active" : ""}" data-tf="${t}">${t}</button>`).join("")}</div>
             <div class="card chart-card" style="position:relative"><div class="chart" id="chart"></div><div class="chart-status" id="chart-status">Cargando velas de Coinbase…</div>
               <div class="chart-legend"><span><i style="background:var(--accent)"></i>Entrada</span><span><i style="background:var(--down)"></i>Stop Loss</span>
-                <span><i style="background:var(--up)"></i>Take Profit</span><span><i style="background:var(--warn)"></i>Breakeven</span><span>▲ compra · ▼ venta</span></div></div>
+                <span><i style="background:var(--up)"></i>Take Profit</span><span><i style="background:var(--warn)"></i>Breakeven</span><span>▲ largo · ▼ corto / salida</span></div></div>
             <div id="a-position"></div>
           </div>
           <div class="stack">
@@ -314,7 +315,7 @@ function renderAssetDetail(p) {
   $("#a-count").textContent = a.trades.length ? `${a.trades.length} operaciones` : "";
   $("#a-trades").innerHTML = a.trades.length ? a.trades.map((t) => `
     <div class="trade ${S.selectedTrade === t.trade_id ? "selected" : ""}" data-id="${esc(t.trade_id)}">
-      <div><div class="trade-title">${t.net_pnl >= 0 ? "✅" : "🔴"} ${esc(t.exit_reason)}</div>
+      <div><div class="trade-title">${t.net_pnl >= 0 ? "✅" : "🔴"} ${t.side === "SELL" ? `<span class="pill pill-warn">CORTO</span>` : `<span class="pill pill-accent">LARGO</span>`} ${esc(t.exit_reason)}</div>
         <div class="trade-sub">${dt(t.opened_at)} → ${dt(t.closed_at)} · ${dur(t.duration_s)}</div>
         <div class="trade-sub mono">${fpx(pid, t.entry_price)} → ${fpx(pid, t.exit_price)} · fees ${fusd(t.fees)}</div></div>
       <div class="trade-pnl ${cls(t.net_pnl)}">${fsign(t.net_pnl)}<div style="font-size:12px">${fpct(t.net_pct)}</div></div></div>`).join("")
@@ -379,15 +380,17 @@ function applyOverlays() {
   const markers = [];
   if (a) {
     for (const t of a.trades) {
-      markers.push({ time: barTime(t.opened_at), position: "belowBar", color: css("--accent"), shape: "arrowUp", text: "" });
-      markers.push({ time: barTime(t.closed_at), position: "aboveBar", color: t.net_pnl >= 0 ? css("--up") : css("--down"), shape: "arrowDown", text: fpct(t.net_pct, 1) });
+      const sh = t.side === "SELL";
+      markers.push({ time: barTime(t.opened_at), position: sh ? "aboveBar" : "belowBar", color: sh ? css("--warn") : css("--accent"), shape: sh ? "arrowDown" : "arrowUp", text: sh ? "Corto" : "" });
+      markers.push({ time: barTime(t.closed_at), position: sh ? "belowBar" : "aboveBar", color: t.net_pnl >= 0 ? css("--up") : css("--down"), shape: sh ? "arrowUp" : "arrowDown", text: fpct(t.net_pct, 1) });
     }
     const p = a.position;
     if (p) {
-      markers.push({ time: barTime(p.opened_at), position: "belowBar", color: css("--accent"), shape: "arrowUp", text: "Entrada" });
+      const psh = p.side === "SELL";
+      markers.push({ time: barTime(p.opened_at), position: psh ? "aboveBar" : "belowBar", color: psh ? css("--warn") : css("--accent"), shape: psh ? "arrowDown" : "arrowUp", text: psh ? "Corto" : "Largo" });
       line(p.entry_price, css("--accent"), "Entrada", 0, 2);
       if (isTrend(p)) {
-        line(p.stop_price, css("--down"), "Trailing 5×ATR", 0, 2);
+        line(p.stop_price, css("--down"), "Trailing ATR", 0, 2);
       } else {
         line(p.stop_price, css("--down"), p.breakeven_armed ? "SL (trailing)" : "SL", 0, 2);
         (p.tp_levels || []).forEach((lv, i) => line(lv.price, css("--up"), `TP${i + 1} ${(lv.fraction * 100).toFixed(0)}%${lv.filled ? " ✓" : ""}`));

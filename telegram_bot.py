@@ -197,21 +197,22 @@ class TelegramNotifier:
         self, pos: Position, sig: Signal, res: "EntryResult", sizing: "SizingResult", mode: str
     ) -> None:
         notional = pos.entry_price * pos.size
-        est_exit_fee = pos.take_profit * pos.size * pos.entry_fee_rate
+        est_exit_fee = pos.entry_price * pos.size * pos.entry_fee_rate
         tps = " / ".join(f"{_px(l.price)} ({l.fraction*100:.0f}%)" for l in pos.tp_levels)
         self.send(
             f"🟢 <b>ENTRADA EJECUTADA</b> [{_e(mode)}]\n"
-            f"<b>{_e(pos.product_id)}</b> LONG · {_e(sig.strategy.value)}\n"
+            f"<b>{_e(pos.product_id)}</b> {'🔻 CORTO' if pos.is_short else '🔺 LARGO'} · {_e(sig.strategy.value)}\n"
             f"Llenado: <code>{_px(pos.entry_price)}</code> · {'MAKER (Post-Only)' if res.maker else 'TAKER'}"
             f" · {res.attempts} intento(s)\n"
             f"Tamaño: <code>{pos.size:g}</code> ≈ <b>{notional:,.2f} USDC</b>\n"
-            f"Stop Loss: <code>{_px(pos.stop_price)}</code> · TP final: <code>{_px(pos.take_profit)}</code>\n"
-            f"TPs escalonados: {tps}\n"
+            f"Stop Loss: <code>{_px(pos.stop_price)}</code>"
+            + (" · trailing por ATR (sin TP fijo)\n" if sig.strategy.value == "TREND_6H"
+               else f" · TP final: <code>{_px(pos.take_profit)}</code>\nTPs escalonados: {tps}\n") +
             f"OBI L2: <b>{sig.obi:+.2f}</b> · Régimen: <b>{_e(sig.regime.value)}</b>\n"
             f"Riesgo: {sizing.risk_usd:,.2f} USDC ({_e(sizing.method)}) · RR neto {sizing.net_rr:.2f}\n"
             f"Comisión entrada: {pos.entry_fee_paid:.4f} USDC · salida est.: {est_exit_fee:.4f} USDC\n"
-            f"Recorrido proyectado: {sig.projected_move_pct:.2f}%\n"
-            f"<i>{_e(sig.reason)}</i>"
+            + (f"Recorrido proyectado: {sig.projected_move_pct:.2f}%\n" if sig.projected_move_pct == sig.projected_move_pct else "")
+            + f"<i>{_e(sig.reason)}</i>"
         )
 
     def notify_breakeven(self, pos: Position, be_price: float, mode: str) -> None:

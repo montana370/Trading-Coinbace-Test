@@ -6,7 +6,12 @@ exchange.py — Adaptadores de exchange.
 * `PaperGateway` (PAPER): simulador de matching realista que consume el MISMO
   flujo de WebSocket en vivo: órdenes Post-Only con posición en cola L2,
   rechazo si cruzan el spread, ejecución a mercado recorriendo el libro y
-  comisiones Maker/Taker reales.
+  comisiones Maker/Taker reales. En perpetuos lleva posiciones netas
+  (largo/corto), PnL realizado, margen y financiación.
+
+Unidades: el resto del bot trabaja SIEMPRE con el par lógico (p. ej. BTC-USDC)
+y tamaños en unidades del activo (BTC). El gateway traduce al producto real
+(p. ej. BIP-20DEC30-CDE) y a contratos (1 contrato = 0.01 BTC).
 
 Ambos implementan la interfaz `Gateway` y emiten `OrderUpdate` normalizados
 hacia `on_order_update`, igual que el canal `user` de Coinbase.
@@ -42,11 +47,31 @@ class PostOnlyRejected(ExchangeError):
 
 @dataclass
 class ProductMeta:
-    product_id: str
-    base_increment: float
-    quote_increment: float
+    product_id: str               # par lógico (BTC-USDC)
+    base_increment: float         # en unidades del activo (en perpetuos = tamaño del contrato)
+    quote_increment: float        # tick de precio
     base_min_size: float
     quote_min_size: float
+    contract_size: float = 1.0    # 1 en spot; p. ej. 0.01 BTC por contrato en BIP
+    exchange_id: str = ""         # producto real en Coinbase
+    is_future: bool = False
+
+
+def meta_from_product(pid: str, p: dict[str, Any]) -> ProductMeta:
+    if (p.get("product_type") or "").upper() == "FUTURE":
+        cs = float(to_dict(p.get("future_product_details")).get("contract_size") or 1.0)
+        return ProductMeta(
+            product_id=pid, base_increment=cs * float(p["base_increment"]),
+            quote_increment=float(p.get("price_increment") or p["quote_increment"]),
+            base_min_size=cs * float(p["base_min_size"]), quote_min_size=0.0,
+            contract_size=cs, exchange_id=p["product_id"], is_future=True,
+        )
+    return ProductMeta(
+        product_id=pid, base_increment=float(p["base_increment"]),
+        quote_increment=float(p.get("price_increment") or p["quote_increment"]),
+        base_min_size=float(p["base_min_size"]), quote_min_size=float(p.get("quote_min_size") or 1.0),
+        exchange_id=p.get("product_id", pid),
+    )
 
 
 def to_dict(resp: Any) -> dict[str, Any]:
@@ -97,10 +122,38 @@ class Gateway(ABC):
         self.on_order_update: OrderCallback | None = None
         self.last_latency_ms: float = 0.0
         self.products: dict[str, ProductMeta] = {}
+        self.venue: dict[str, str] = {}          # par lógico → producto real
+
+    # ── traducción par lógico ↔ producto real ──────────────────────────────
+    def set_venue_map(self, venue: dict[str, str]) -> None:
+        self.venue = dict(venue)
+
+    def vid(self, pid: str) -> str:
+        return self.venue.get(pid, pid)
+
+    def lid(self, exchange_id: str) -> str:
+        for k, v in self.venue.items():
+            if v == exchange_id:
+                return k
+        return exchange_id
+
+    def to_units(self, pid: str, exchange_qty: float) -> float:
+        """Cantidad del exchange (contratos en perpetuos) → unidades del activo."""
+        m = self.products.get(pid)
+        return exchange_qty * (m.contract_size if m else 1.0)
+
+    def _size_str(self, pid: str, base_size: float) -> str:
+        m = self.meta(pid)
+        units = round_step(base_size, m.base_increment) / m.contract_size
+        return fmt_step(units, m.base_increment / m.contract_size)
 
     async def _emit(self, upd: OrderUpdate) -> None:
         if self.on_order_update is not None:
             await self.on_order_update(upd)
+
+    @property
+    def is_perps(self) -> bool:
+        return any(m.is_future for m in self.products.values())
 
     @abstractmethod
     async def load_products(self, product_ids: list[str]) -> dict[str, ProductMeta]: ...
@@ -110,7 +163,8 @@ class Gateway(ABC):
                           seconds: int = 60) -> list[dict[str, Any]]: ...
 
     @abstractmethod
-    async def get_balances(self) -> dict[str, float]: ...
+    async def get_balances(self) -> dict[str, float]:
+        """{'USDC': caja}. En perpetuos además '_unrealized' (PnL flotante de la cuenta)."""
 
     @abstractmethod
     async def place_post_only(
@@ -118,13 +172,22 @@ class Gateway(ABC):
     ) -> str: ...
 
     @abstractmethod
-    async def place_market_sell(self, product_id: str, base_size: float, client_order_id: str) -> str: ...
+    async def place_market(self, product_id: str, side: Side, base_size: float, client_order_id: str) -> str: ...
 
     @abstractmethod
+    async def place_bracket(
+        self, product_id: str, side: Side, base_size: float, limit_price: float, stop_trigger: float,
+        client_order_id: str,
+    ) -> str:
+        """Bracket GTC de cierre: límite (TP) + stop de protección residente en el exchange."""
+
+    async def place_market_sell(self, product_id: str, base_size: float, client_order_id: str) -> str:
+        return await self.place_market(product_id, Side.SELL, base_size, client_order_id)
+
     async def place_bracket_sell(
         self, product_id: str, base_size: float, limit_price: float, stop_trigger: float, client_order_id: str
     ) -> str:
-        """Venta bracket GTC: límite de TP + stop de protección residente en el exchange."""
+        return await self.place_bracket(product_id, Side.SELL, base_size, limit_price, stop_trigger, client_order_id)
 
     @abstractmethod
     async def cancel(self, order_ids: list[str]) -> None: ...
@@ -146,7 +209,7 @@ class Gateway(ABC):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# LIVE — Coinbase Advanced Trade v3
+# LIVE — Coinbase Advanced Trade v3 (spot y perpetuos US de Coinbase Financial Markets)
 # ═════════════════════════════════════════════════════════════════════════════
 class CoinbaseGateway(Gateway):
     mode = "LIVE"
@@ -156,6 +219,7 @@ class CoinbaseGateway(Gateway):
         from coinbase.rest import RESTClient
 
         self.client = RESTClient(api_key=api_key, api_secret=api_secret, timeout=timeout)
+        self._bracket_unsupported = False
 
     async def _call(self, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> dict[str, Any]:
         t0 = time.perf_counter()
@@ -167,21 +231,25 @@ class CoinbaseGateway(Gateway):
 
     async def load_products(self, product_ids: list[str]) -> dict[str, ProductMeta]:
         for pid in product_ids:
-            p = await self._call(self.client.get_product, pid)
-            self.products[pid] = ProductMeta(
-                product_id=pid,
-                base_increment=float(p["base_increment"]),
-                quote_increment=float(p.get("price_increment") or p["quote_increment"]),
-                base_min_size=float(p["base_min_size"]),
-                quote_min_size=float(p.get("quote_min_size") or 1.0),
-            )
+            p = await self._call(self.client.get_product, self.vid(pid))
+            self.products[pid] = meta_from_product(pid, p)
         return self.products
 
     async def get_candles(self, product_id: str, minutes: int, granularity: str = "ONE_MINUTE",
                           seconds: int = 60) -> list[dict[str, Any]]:
-        return await _fetch_candles(self._call, self.client.get_candles, product_id, minutes, granularity, seconds)
+        return await _fetch_candles(self._call, self.client.get_candles, self.vid(product_id), minutes,
+                                    granularity, seconds)
 
     async def get_balances(self) -> dict[str, float]:
+        if self.is_perps:
+            resp = await self._call(self.client.get_futures_balance_summary)
+            bs = to_dict(resp.get("balance_summary"))
+
+            def val(k: str) -> float:
+                return float(to_dict(bs.get(k)).get("value") or 0.0)
+
+            return {"USDC": val("total_usd_balance"), "_unrealized": val("unrealized_pnl"),
+                    "_buying_power": val("futures_buying_power")}
         out: dict[str, float] = {}
         cursor: str | None = None
         while True:
@@ -209,33 +277,50 @@ class CoinbaseGateway(Gateway):
         self, product_id: str, side: Side, base_size: float, price: float, client_order_id: str
     ) -> str:
         m = self.meta(product_id)
-        size_s = fmt_step(round_step(base_size, m.base_increment), m.base_increment)
         price_s = fmt_step(round_step(price, m.quote_increment, up=side is Side.SELL), m.quote_increment)
         fn = self.client.limit_order_gtc_buy if side is Side.BUY else self.client.limit_order_gtc_sell
         resp = await self._call(
-            fn, client_order_id=client_order_id, product_id=product_id,
-            base_size=size_s, limit_price=price_s, post_only=True,
+            fn, client_order_id=client_order_id, product_id=self.vid(product_id),
+            base_size=self._size_str(product_id, base_size), limit_price=price_s, post_only=True,
         )
         return self._parse_create(resp)
 
-    async def place_bracket_sell(
-        self, product_id: str, base_size: float, limit_price: float, stop_trigger: float, client_order_id: str
+    async def place_market(self, product_id: str, side: Side, base_size: float, client_order_id: str) -> str:
+        resp = await self._call(
+            self.client.market_order, client_order_id=client_order_id, product_id=self.vid(product_id),
+            side=side.value, base_size=self._size_str(product_id, base_size),
+        )
+        return self._parse_create(resp)
+
+    async def place_bracket(
+        self, product_id: str, side: Side, base_size: float, limit_price: float, stop_trigger: float,
+        client_order_id: str,
     ) -> str:
         m = self.meta(product_id)
+        q = m.quote_increment
+        size_s = self._size_str(product_id, base_size)
+        if not self._bracket_unsupported:
+            try:
+                resp = await self._call(
+                    self.client.trigger_bracket_order_gtc, client_order_id=client_order_id,
+                    product_id=self.vid(product_id), side=side.value, base_size=size_s,
+                    limit_price=fmt_step(round_step(limit_price, q, up=side is Side.SELL), q),
+                    stop_trigger_price=fmt_step(round_step(stop_trigger, q, up=side is Side.BUY), q),
+                )
+                return self._parse_create(resp)
+            except ExchangeError as exc:
+                if "UNSUPPORTED" not in str(exc).upper() and "INVALID_ORDER_CONFIG" not in str(exc).upper():
+                    raise
+                log.warning("Bracket no soportado en %s (%s): uso stop-limit", product_id, exc)
+                self._bracket_unsupported = True
+        # Alternativa: stop-limit GTC de protección (sin TP), límite 2 % más allá del disparo
+        stop_s = fmt_step(round_step(stop_trigger, q, up=side is Side.BUY), q)
+        lim = stop_trigger * (0.98 if side is Side.SELL else 1.02)
         resp = await self._call(
-            self.client.trigger_bracket_order_gtc_sell, client_order_id=client_order_id, product_id=product_id,
-            base_size=fmt_step(round_step(base_size, m.base_increment), m.base_increment),
-            limit_price=fmt_step(round_step(limit_price, m.quote_increment, up=True), m.quote_increment),
-            stop_trigger_price=fmt_step(round_step(stop_trigger, m.quote_increment), m.quote_increment),
-        )
-        return self._parse_create(resp)
-
-    async def place_market_sell(self, product_id: str, base_size: float, client_order_id: str) -> str:
-        m = self.meta(product_id)
-        size_s = fmt_step(round_step(base_size, m.base_increment), m.base_increment)
-        resp = await self._call(
-            self.client.market_order_sell, client_order_id=client_order_id,
-            product_id=product_id, base_size=size_s,
+            self.client.stop_limit_order_gtc, client_order_id=client_order_id, product_id=self.vid(product_id),
+            side=side.value, base_size=size_s, limit_price=fmt_step(round_step(lim, q, up=side is Side.BUY), q),
+            stop_price=stop_s,
+            stop_direction="STOP_DIRECTION_STOP_DOWN" if side is Side.SELL else "STOP_DIRECTION_STOP_UP",
         )
         return self._parse_create(resp)
 
@@ -245,25 +330,24 @@ class CoinbaseGateway(Gateway):
         for i in range(0, len(order_ids), 100):  # límite del endpoint batch_cancel
             await self._call(self.client.cancel_orders, order_ids=order_ids[i:i + 100])
 
-    @staticmethod
-    def _to_update(o: dict[str, Any]) -> OrderUpdate:
+    def _to_update(self, o: dict[str, Any]) -> OrderUpdate:
         cfg = to_dict(o.get("order_configuration"))
         limit_price = 0.0
         for v in cfg.values():
             v = to_dict(v)
             if "limit_price" in v:
                 limit_price = float(v["limit_price"])
-        filled = float(o.get("filled_size") or 0.0)
+        pid = self.lid(o["product_id"])
         return OrderUpdate(
             order_id=o["order_id"],
             client_order_id=o.get("client_order_id", ""),
-            product_id=o["product_id"],
+            product_id=pid,
             side=Side(o["side"]),
             status=map_status(o.get("status", "")),
-            filled_size=filled,
+            filled_size=self.to_units(pid, float(o.get("filled_size") or 0.0)),
             avg_price=float(o.get("average_filled_price") or 0.0),
             total_fees=float(o.get("total_fees") or 0.0),
-            leaves_size=max(float(o.get("leaves_quantity") or 0.0), 0.0),
+            leaves_size=self.to_units(pid, max(float(o.get("leaves_quantity") or 0.0), 0.0)),
             limit_price=limit_price,
         )
 
@@ -273,7 +357,8 @@ class CoinbaseGateway(Gateway):
         return self._to_update(o) if o else None
 
     async def list_open_orders(self, product_ids: list[str]) -> list[OrderUpdate]:
-        resp = await self._call(self.client.list_orders, product_ids=product_ids, order_status=["OPEN"])
+        resp = await self._call(self.client.list_orders, product_ids=[self.vid(p) for p in product_ids],
+                                order_status=["OPEN"])
         return [self._to_update(to_dict(o)) for o in resp.get("orders", [])]
 
     async def ping(self) -> float:
@@ -281,7 +366,8 @@ class CoinbaseGateway(Gateway):
         return self.last_latency_ms
 
     async def fee_rates(self) -> tuple[float, float] | None:
-        resp = await self._call(self.client.get_transaction_summary)
+        kwargs = {"product_type": "FUTURE"} if self.is_perps else {}
+        resp = await self._call(self.client.get_transaction_summary, **kwargs)
         tier = to_dict(resp.get("fee_tier"))
         if not tier:
             return None
@@ -333,7 +419,7 @@ class _PaperOrder:
     notional: float = 0.0
     fees: float = 0.0
     queue_ahead: float = 0.0
-    stop_trigger: float = 0.0          # >0 ⇒ orden bracket
+    stop_trigger: float = 0.0          # >0 ⇒ orden bracket (stop de protección)
     status: OrderStatus = OrderStatus.OPEN
 
     @property
@@ -346,6 +432,12 @@ class _PaperOrder:
 
 
 class PaperGateway(Gateway):
+    """
+    Spot: saldos por moneda (sólo largo). Perpetuos (`perps=True`): caja en USDC +
+    posición neta por par (POS:<par>, AVG:<par>), PnL realizado al reducir,
+    control de margen con apalancamiento máximo y cargo de financiación.
+    """
+
     mode = "PAPER"
 
     def __init__(
@@ -355,6 +447,8 @@ class PaperGateway(Gateway):
         maker_fee: float,
         taker_fee: float,
         quote: str = "USDC",
+        perps: bool = False,
+        max_leverage: float = 1.0,
     ) -> None:
         super().__init__()
         from coinbase.rest import RESTClient
@@ -364,6 +458,8 @@ class PaperGateway(Gateway):
         self.maker_fee = maker_fee
         self.taker_fee = taker_fee
         self.quote = quote
+        self.perps_mode = perps
+        self.max_leverage = max_leverage
         self.balances: dict[str, float] = {quote: starting_equity}
         self.orders: dict[str, _PaperOrder] = {}
 
@@ -381,22 +477,80 @@ class PaperGateway(Gateway):
 
     async def load_products(self, product_ids: list[str]) -> dict[str, ProductMeta]:
         for pid in product_ids:
-            p = await self._call(self.public.get_public_product, pid)
-            self.products[pid] = ProductMeta(
-                product_id=pid,
-                base_increment=float(p["base_increment"]),
-                quote_increment=float(p.get("price_increment") or p["quote_increment"]),
-                base_min_size=float(p["base_min_size"]),
-                quote_min_size=float(p.get("quote_min_size") or 1.0),
-            )
+            p = await self._call(self.public.get_public_product, self.vid(pid))
+            self.products[pid] = meta_from_product(pid, p)
         return self.products
 
     async def get_candles(self, product_id: str, minutes: int, granularity: str = "ONE_MINUTE",
                           seconds: int = 60) -> list[dict[str, Any]]:
-        return await _fetch_candles(self._call, self.public.get_public_candles, product_id, minutes,
+        return await _fetch_candles(self._call, self.public.get_public_candles, self.vid(product_id), minutes,
                                     granularity, seconds)
 
+    # ── posiciones (perpetuos) ──────────────────────────────────────────────
+    def position(self, pid: str) -> tuple[float, float]:
+        return self.balances.get(f"POS:{pid}", 0.0), self.balances.get(f"AVG:{pid}", 0.0)
+
+    def _mark(self, pid: str) -> float:
+        mk = self.markets[pid]
+        return mk.book.mid or mk.last_price
+
+    def unrealized(self) -> float:
+        tot = 0.0
+        for k, qty in self.balances.items():
+            if k.startswith("POS:") and qty:
+                pid = k[4:]
+                px = self._mark(pid)
+                if px and not math.isnan(px):
+                    tot += (px - self.balances.get(f"AVG:{pid}", 0.0)) * qty
+        return tot
+
+    def open_notional(self) -> float:
+        tot = 0.0
+        for k, qty in self.balances.items():
+            if k.startswith("POS:") and qty:
+                px = self._mark(k[4:])
+                tot += abs(qty) * (px if px and not math.isnan(px) else 0.0)
+        return tot
+
+    def charge_funding(self, rate: float) -> float:
+        """Cargo de financiación (modelo conservador: lo paga cualquier posición)."""
+        cost = self.open_notional() * rate
+        self.balances[self.quote] = self.balances.get(self.quote, 0.0) - cost
+        return cost
+
+    def _apply_fill(self, pid: str, side: Side, qty: float, price: float, fee: float) -> None:
+        cash = self.balances.get(self.quote, 0.0) - fee
+        if not self.perps_mode:
+            base = pid.split("-")[0]
+            if side is Side.BUY:
+                cash -= qty * price
+                self.balances[base] = self.balances.get(base, 0.0) + qty
+            else:
+                cash += qty * price
+                self.balances[base] = self.balances.get(base, 0.0) - qty
+            self.balances[self.quote] = cash
+            return
+        pos, avg = self.position(pid)
+        signed = qty if side is Side.BUY else -qty
+        if pos == 0 or (pos > 0) == (signed > 0):          # abre o aumenta
+            new = pos + signed
+            avg = (avg * abs(pos) + price * qty) / abs(new)
+            pos = new
+        else:                                              # reduce, cierra o invierte
+            closing = min(abs(signed), abs(pos))
+            cash += (price - avg) * closing * (1 if pos > 0 else -1)
+            pos += signed
+            if abs(pos) < 1e-12:
+                pos, avg = 0.0, 0.0
+            elif (pos > 0) == (signed > 0):                # invirtió el sentido
+                avg = price
+        self.balances[f"POS:{pid}"] = pos
+        self.balances[f"AVG:{pid}"] = avg
+        self.balances[self.quote] = cash
+
     async def get_balances(self) -> dict[str, float]:
+        if self.perps_mode:
+            return {self.quote: self.balances.get(self.quote, 0.0), "_unrealized": self.unrealized()}
         return dict(self.balances)
 
     def _available(self, currency: str) -> float:
@@ -410,6 +564,22 @@ class PaperGateway(Gateway):
             elif o.side is Side.SELL and currency == base:
                 held += o.leaves
         return self.balances.get(currency, 0.0) - held
+
+    def _check_funds(self, pid: str, side: Side, size: float, price: float, protective: bool = False) -> None:
+        if not self.perps_mode:
+            base = pid.split("-")[0]
+            if side is Side.BUY and not protective and self._available(self.quote) < size * price * (1 + self.maker_fee):
+                raise ExchangeError("INSUFFICIENT_FUND")
+            if side is Side.SELL and self._available(base) < size - 1e-12:
+                raise ExchangeError("INSUFFICIENT_FUND")
+            return
+        pos, _ = self.position(pid)
+        reduces = (pos > 0 and side is Side.SELL) or (pos < 0 and side is Side.BUY)
+        if reduces or protective:
+            return
+        equity = self.balances.get(self.quote, 0.0) + self.unrealized()
+        if self.open_notional() + size * price > equity * self.max_leverage + 1e-6:
+            raise ExchangeError("INSUFFICIENT_MARGIN")
 
     async def place_post_only(
         self, product_id: str, side: Side, base_size: float, price: float, client_order_id: str
@@ -426,11 +596,7 @@ class PaperGateway(Gateway):
             raise ExchangeError(f"Tamaño {size} < mínimo {m.base_min_size}")
         if (side is Side.BUY and price >= ba) or (side is Side.SELL and price <= bb):
             raise PostOnlyRejected("INVALID_LIMIT_PRICE_POST_ONLY")
-        base = product_id.split("-")[0]
-        if side is Side.BUY and self._available(self.quote) < size * price * (1 + self.maker_fee):
-            raise ExchangeError("INSUFFICIENT_FUND")
-        if side is Side.SELL and self._available(base) < size - 1e-12:
-            raise ExchangeError("INSUFFICIENT_FUND")
+        self._check_funds(product_id, side, size, price)
         book_side = mk.book.bids if side is Side.BUY else mk.book.asks
         order = _PaperOrder(
             order_id=f"paper-{uuid.uuid4().hex[:20]}",
@@ -446,49 +612,52 @@ class PaperGateway(Gateway):
         await self._emit(self._update(order))
         return order.order_id
 
-    async def place_market_sell(self, product_id: str, base_size: float, client_order_id: str) -> str:
+    async def place_market(self, product_id: str, side: Side, base_size: float, client_order_id: str) -> str:
         m = self.meta(product_id)
         mk = self.markets[product_id]
-        base = product_id.split("-")[0]
-        size = min(round_step(base_size, m.base_increment), self._available(base))
+        size = round_step(base_size, m.base_increment)
+        if not self.perps_mode and side is Side.SELL:
+            size = min(size, self._available(product_id.split("-")[0]))
         if size <= 0:
             raise ExchangeError("INSUFFICIENT_FUND")
-        bids, _ = mk.book.top(200)
+        bids, asks = mk.book.top(200)
+        levels = bids if side is Side.SELL else asks
         remaining, notional = size, 0.0
-        for px, qty in bids:
+        for px, qty in levels:
             take = min(remaining, qty)
             notional += take * px
             remaining -= take
             if remaining <= 1e-12:
                 break
-        if remaining > 1e-12:  # libro insuficiente: resto al peor precio - guardia
-            worst = (bids[-1][0] if bids else mk.last_price) * 0.995
-            notional += remaining * worst
+        if remaining > 1e-12:  # libro insuficiente: resto al peor precio con guardia
+            ref = levels[-1][0] if levels else mk.last_price
+            notional += remaining * ref * (0.995 if side is Side.SELL else 1.005)
         fee = notional * self.taker_fee
         order = _PaperOrder(
             order_id=f"paper-{uuid.uuid4().hex[:20]}", client_order_id=client_order_id,
-            product_id=product_id, side=Side.SELL, price=0.0, size=size,
+            product_id=product_id, side=side, price=0.0, size=size,
             filled=size, notional=notional, fees=fee, status=OrderStatus.FILLED,
         )
-        self.balances[base] = self.balances.get(base, 0.0) - size
-        self.balances[self.quote] = self.balances.get(self.quote, 0.0) + notional - fee
+        self._apply_fill(product_id, side, size, notional / size, fee)
         self.orders[order.order_id] = order
         await self._emit(self._update(order))
         return order.order_id
 
-    async def place_bracket_sell(
-        self, product_id: str, base_size: float, limit_price: float, stop_trigger: float, client_order_id: str
+    async def place_bracket(
+        self, product_id: str, side: Side, base_size: float, limit_price: float, stop_trigger: float,
+        client_order_id: str,
     ) -> str:
         m = self.meta(product_id)
         size = round_step(base_size, m.base_increment)
-        base = product_id.split("-")[0]
-        if size < m.base_min_size or self._available(base) < size - 1e-12:
+        if size < m.base_min_size:
             raise ExchangeError("INSUFFICIENT_FUND")
+        self._check_funds(product_id, side, size, limit_price, protective=True)
+        book = self.markets[product_id].book
         order = _PaperOrder(
             order_id=f"paper-{uuid.uuid4().hex[:20]}", client_order_id=client_order_id, product_id=product_id,
-            side=Side.SELL, price=round_step(limit_price, m.quote_increment, up=True), size=size,
-            stop_trigger=round_step(stop_trigger, m.quote_increment),
-            queue_ahead=self.markets[product_id].book.asks.get(limit_price, 0.0),
+            side=side, price=round_step(limit_price, m.quote_increment, up=side is Side.SELL), size=size,
+            stop_trigger=round_step(stop_trigger, m.quote_increment, up=side is Side.BUY),
+            queue_ahead=(book.asks if side is Side.SELL else book.bids).get(limit_price, 0.0),
         )
         self.orders[order.order_id] = order
         await self._emit(self._update(order))
@@ -526,21 +695,20 @@ class PaperGateway(Gateway):
         )
 
     async def on_market_trade(self, product_id: str, price: float, size: float) -> None:
-        """Matching de órdenes límite contra el flujo de trades real."""
+        """Matching de órdenes contra el flujo de trades real."""
         for o in list(self.orders.values()):
             if o.status is not OrderStatus.OPEN or o.product_id != product_id:
                 continue
-            if o.stop_trigger > 0 and price <= o.stop_trigger:
-                # disparo del stop del bracket: ejecución a mercado (taker) al precio negociado
+            triggered = o.stop_trigger > 0 and (
+                (o.side is Side.SELL and price <= o.stop_trigger) or (o.side is Side.BUY and price >= o.stop_trigger))
+            if triggered:
+                # disparo del stop: ejecución a mercado (taker) al precio negociado
                 fill = o.leaves
-                notional = fill * price
-                fee = notional * self.taker_fee
-                base = product_id.split("-")[0]
+                fee = fill * price * self.taker_fee
                 o.filled += fill
-                o.notional += notional
+                o.notional += fill * price
                 o.fees += fee
-                self.balances[base] = self.balances.get(base, 0.0) - fill
-                self.balances[self.quote] = self.balances.get(self.quote, 0.0) + notional - fee
+                self._apply_fill(product_id, o.side, fill, price, fee)
                 o.status = OrderStatus.FILLED
                 await self._emit(self._update(o))
                 continue
@@ -558,18 +726,11 @@ class PaperGateway(Gateway):
                 fill = min(o.leaves, consume)
             if fill <= 0:
                 continue
-            notional = fill * o.price
-            fee = notional * self.maker_fee
-            base = product_id.split("-")[0]
+            fee = fill * o.price * self.maker_fee
             o.filled += fill
-            o.notional += notional
+            o.notional += fill * o.price
             o.fees += fee
-            if o.side is Side.BUY:
-                self.balances[self.quote] = self.balances.get(self.quote, 0.0) - notional - fee
-                self.balances[base] = self.balances.get(base, 0.0) + fill
-            else:
-                self.balances[base] = self.balances.get(base, 0.0) - fill
-                self.balances[self.quote] = self.balances.get(self.quote, 0.0) + notional - fee
+            self._apply_fill(product_id, o.side, fill, o.price, fee)
             if o.leaves <= 1e-12:
                 o.status = OrderStatus.FILLED
             await self._emit(self._update(o))

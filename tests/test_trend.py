@@ -68,7 +68,7 @@ async def test_trend_position_lifecycle(tmp_path):
     ex = ExecutionHandler(settings, gw, markets, strat, risk, db, TelegramNotifier("", ""),
                           validator=lambda s: (True, "OK"))
     atr6 = 2.0
-    sig = Signal(PID, StrategyName.TREND, Side.BUY, Regime.TREND, 99.99, 99.99 - 5 * atr6, 99.99 * 4,
+    sig = Signal(PID, StrategyName.TREND, Side.BUY, Regime.TREND, 99.99, 99.99 - settings.trend.k_atr * atr6, 99.99 * 4,
                  atr6, 0.2, float("nan"), "test")
     sizing = risk.size_position(sig, 99.99, 10_000, 10_000, 0.004, 0.006, gw.meta(PID), [])
     assert sizing.ok and sizing.risk_usd <= 100.0 + 1e-6
@@ -81,11 +81,11 @@ async def test_trend_position_lifecycle(tmp_path):
     brackets = [o for o in gw.orders.values() if o.stop_trigger > 0 and o.status.value == "OPEN"]
     assert len(brackets) == 1 and brackets[0].size == pytest.approx(pos.size)
 
-    _book(mk, 115.0, 115.02)                               # +7.5 ATR: trailing sin breakeven
+    _book(mk, 115.0, 115.02)                               # +7.5 ATR: trailing sin breakeven (k de config)
     await ex.manage_positions()
     await asyncio.gather(*ex._stop_update_tasks.values())
     assert not pos.breakeven_armed
-    assert pos.stop_price == pytest.approx(115.0 - 5 * atr6)
+    assert pos.stop_price == pytest.approx(115.0 - settings.trend.k_atr * atr6)
     trig = [o.stop_trigger for o in gw.orders.values() if o.stop_trigger > 0 and o.status.value == "OPEN"]
     assert trig and trig[0] == pytest.approx(round(pos.stop_price * 0.998, 2), abs=0.011)
 

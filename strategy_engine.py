@@ -143,8 +143,12 @@ class TrendState:
     exit_level: float = float("nan")
     ema: float = float("nan")
     atr: float = float("nan")
-    breakout: bool = False
-    channel_exit: bool = False
+    breakout: bool = False          # largo: cierre > máx(N) y > EMA200
+    channel_exit: bool = False      # salida de largos: cierre < mín(M)
+    breakdown: bool = False         # corto: cierre < mín(N) y < EMA200
+    channel_exit_short: bool = False  # salida de cortos: cierre > máx(M)
+    short_entry_level: float = float("nan")
+    short_exit_level: float = float("nan")
 
 
 class TrendStrategy:
@@ -169,8 +173,12 @@ class TrendStrategy:
         st.exit_level = float(np.min(l[-cfg.n_exit - 1:-1]))
         st.ema = float(ind.ema(c, cfg.ema_period)[-1])
         st.atr = float(ind.atr(h, l, c, cfg.atr_period)[-1])
+        st.short_entry_level = float(np.min(l[-cfg.n_entry - 1:-1]))
+        st.short_exit_level = float(np.max(h[-cfg.n_exit - 1:-1]))
         st.breakout = st.close > st.entry_level and st.close > st.ema
         st.channel_exit = st.close < st.exit_level
+        st.breakdown = st.close < st.short_entry_level and st.close < st.ema
+        st.channel_exit_short = st.close > st.short_exit_level
         return st
 
     def update(self, mk: MarketState) -> tuple[TrendState, bool]:
@@ -370,9 +378,17 @@ class StrategyEngine:
             return a, None, st
         dist = (st.entry_level - a.price) / a.price * 100 if a.price else float("nan")
         a.projected_move_pct = dist
-        base = (f"TREND_6H: cierre {st.close:.6g} · ruptura {st.entry_level:.6g} · EMA200 {st.ema:.6g}")
-        if not st.breakout:
-            why = "bajo EMA200" if st.close <= st.ema else f"falta {dist:+.2f}% para la ruptura"
+        base = (f"TREND_6H: cierre {st.close:.6g} · ruptura ↑ {st.entry_level:.6g} · ↓ {st.short_entry_level:.6g}"
+                f" · EMA200 {st.ema:.6g}")
+        short = bool(st.breakdown and self.tcfg.allow_short)
+        if not st.breakout and not short:
+            if st.close > st.ema:
+                why = f"alcista: falta {dist:+.2f}% para la ruptura"
+            elif self.tcfg.allow_short:
+                dd = (st.short_entry_level - a.price) / a.price * 100 if a.price else float("nan")
+                why = f"bajista: falta {dd:+.2f}% para la ruptura bajista"
+            else:
+                why = "bajo EMA200 (cortos desactivados)"
             a.signal_state = f"{base} · sin señal ({why})"
             return a, None, st
         if time.time() - st.bar_close_ts > self.tcfg.entry_window_s:
@@ -381,22 +397,33 @@ class StrategyEngine:
         if not mk.is_ready or math.isnan(a.spread_pct) or a.spread_pct > pcfg.max_spread_pct:
             a.signal_state = f"{base} · ruptura bloqueada por spread"
             return a, None, st
-        if a.obi < self.cfg.obi_min_long:
+        # Microestructura: no comprar contra un muro de venta ni vender en corto contra uno de compra
+        wall = self.tcfg.obi_wall_veto
+        if (not short and a.obi <= -wall) or (short and a.obi >= wall):
             a.signal_state = f"{base} · ruptura bloqueada por OBI {a.obi:+.2f}"
             return a, None, st
-        if mk.product_id != ORACLE_PRODUCT and self.oracle.state.veto:
+        if not short and mk.product_id != ORACLE_PRODUCT and self.oracle.state.veto:
             a.signal_state = f"{base} · ruptura bloqueada por el oráculo BTC"
             return a, None, st
-        price = a.best_bid if not math.isnan(a.best_bid) else a.price
-        sig = Signal(
-            product_id=mk.product_id, strategy=StrategyName.TREND, side=Side.BUY, regime=Regime.TREND,
-            ref_price=price, stop_price=price - self.tcfg.k_atr * st.atr,
-            take_profit=price * self.tcfg.far_tp_multiple, atr=st.atr, obi=a.obi,
-            projected_move_pct=float("nan"),
-            reason=f"Ruptura Donchian {self.tcfg.n_entry}×6h ({st.close:.6g} > {st.entry_level:.6g}) sobre EMA200",
-        )
+        k = self.tcfg.k_atr * st.atr
+        if short:
+            price = a.best_ask if not math.isnan(a.best_ask) else a.price
+            sig = Signal(
+                product_id=mk.product_id, strategy=StrategyName.TREND, side=Side.SELL, regime=Regime.TREND,
+                ref_price=price, stop_price=price + k, take_profit=price / self.tcfg.far_tp_multiple,
+                atr=st.atr, obi=a.obi, projected_move_pct=float("nan"),
+                reason=f"Ruptura bajista {self.tcfg.n_entry}×6h ({st.close:.6g} < {st.short_entry_level:.6g}) bajo EMA200",
+            )
+        else:
+            price = a.best_bid if not math.isnan(a.best_bid) else a.price
+            sig = Signal(
+                product_id=mk.product_id, strategy=StrategyName.TREND, side=Side.BUY, regime=Regime.TREND,
+                ref_price=price, stop_price=price - k, take_profit=price * self.tcfg.far_tp_multiple,
+                atr=st.atr, obi=a.obi, projected_move_pct=float("nan"),
+                reason=f"Ruptura Donchian {self.tcfg.n_entry}×6h ({st.close:.6g} > {st.entry_level:.6g}) sobre EMA200",
+            )
         sig.ts = st.bar_close_ts
-        a.signal_state = f"SEÑAL TREND_6H · {base}"
+        a.signal_state = f"SEÑAL TREND_6H {'CORTO' if short else 'LARGO'} · {base}"
         return a, sig, st
 
     # ── Estrategia 1: Breakout + Order Flow ─────────────────────────────────

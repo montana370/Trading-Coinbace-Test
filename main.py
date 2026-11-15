@@ -125,14 +125,27 @@ class TradingEngine:
             mode = "PAPER"
         return mode
 
+    @property
+    def perps(self) -> bool:
+        return self.s.venue == "PERPS"
+
+    @property
+    def paper_key(self) -> str:
+        return "paper_balances" if not self.perps else "paper_balances_PERPS"
+
     def _build_gateway(self, mode: str) -> Gateway:
+        venue = {pid: p.exchange_id for pid, p in self.s.pairs.items()}
+        self._venue_rev = {v: k for k, v in venue.items()}
         if mode == "LIVE":
-            return CoinbaseGateway(self.cb_key, self.cb_secret)
-        gw = PaperGateway(
-            self.markets, self.s.runtime.paper_starting_equity,
-            self.s.fees.maker_fee, self.s.fees.taker_fee,
-        )
-        gw.restore_balances(self.db.sync.get_kv("paper_balances") or {})
+            gw: Gateway = CoinbaseGateway(self.cb_key, self.cb_secret)
+        else:
+            gw = PaperGateway(
+                self.markets, self.s.runtime.paper_starting_equity,
+                self.s.fees.maker_fee, self.s.fees.taker_fee,
+                perps=self.perps, max_leverage=self.s.risk.max_leverage,
+            )
+            gw.restore_balances(self.db.sync.get_kv(self.paper_key) or {})
+        gw.set_venue_map(venue)
         return gw
 
     def _build_execution(self) -> ExecutionHandler:
@@ -305,7 +318,7 @@ class TradingEngine:
         conn.last_msg = conn.last_heartbeat = time.time()
 
     def _start_market_ws(self) -> None:
-        products = list(self.s.pairs)
+        products = [p.exchange_id for p in self.s.pairs.values()]
         auth = False   # canales de mercado públicos: no dependen de la clave
         # level2 en conexión dedicada (alto volumen) para aislar el resto de canales
         self.conns["l2"] = WSConn("l2", ["level2"], products, authenticated=auth)
@@ -422,20 +435,29 @@ class TradingEngine:
         Coinbase unifica la liquidez USD/USDC: aunque nos suscribamos a X-USDC,
         los mensajes WebSocket llegan como X-USD. Se resuelven ambos alias.
         """
-        mk = self.markets.get(product_id)
+        mk = self.markets.get(product_id) or self.markets.get(self._venue_rev.get(product_id, ""))
         if mk is None and product_id.endswith("-USD"):
             mk = self.markets.get(product_id + "C")
         return mk
+
+    def _cs(self, mk: MarketState) -> float:
+        """Tamaño de contrato (perpetuos): convierte cantidades del WS a unidades del activo."""
+        m = self.gateway.products.get(mk.product_id)
+        return m.contract_size if m else 1.0
 
     def _on_l2(self, msg: dict[str, Any]) -> None:
         for ev in msg.get("events", []):
             mk = self._market(ev.get("product_id", ""))
             if mk is None:
                 continue
+            ups = ev.get("updates", [])
+            cs = self._cs(mk)
+            if cs != 1.0:
+                ups = [{**u, "new_quantity": float(u["new_quantity"]) * cs} for u in ups]
             if ev.get("type") == "snapshot":
-                mk.book.apply_snapshot(ev.get("updates", []))
+                mk.book.apply_snapshot(ups)
             else:
-                mk.book.apply_updates(ev.get("updates", []))
+                mk.book.apply_updates(ups)
 
     async def _on_trades(self, msg: dict[str, Any]) -> None:
         taker = self.s.execution.trade_side_is_taker
@@ -446,7 +468,7 @@ class TradingEngine:
                 mk = self._market(tr.get("product_id", ""))
                 if mk is None:
                     continue
-                price, size = float(tr["price"]), float(tr["size"])
+                price, size = float(tr["price"]), float(tr["size"]) * self._cs(mk)
                 ts = parse_ts(tr.get("time"))
                 buy = (tr.get("side") == "BUY") == taker
                 if ts <= mk.last_trade_ts - 1.0 and not is_update:
@@ -473,7 +495,8 @@ class TradingEngine:
                 mk = self._market(o.get("product_id", ""))
                 if mk is None:
                     continue
-                cum = float(o.get("cumulative_quantity") or 0.0)
+                cs = self._cs(mk)
+                cum = float(o.get("cumulative_quantity") or 0.0) * cs
                 upd = OrderUpdate(
                     order_id=o.get("order_id", ""),
                     client_order_id=o.get("client_order_id", ""),
@@ -483,7 +506,7 @@ class TradingEngine:
                     filled_size=cum,
                     avg_price=float(o.get("avg_price") or 0.0),
                     total_fees=float(o.get("total_fees") or 0.0),
-                    leaves_size=float(o.get("leaves_quantity") or 0.0),
+                    leaves_size=float(o.get("leaves_quantity") or 0.0) * cs,
                     limit_price=float(o.get("limit_price") or 0.0),
                 )
                 await self.execution.on_order_update(upd)
@@ -565,15 +588,29 @@ class TradingEngine:
 
     async def _check_channel_exit(self, pid: str, st: Any) -> None:
         """Salida de tendencia: cierre de vela 6 h por debajo del mínimo de M velas."""
-        if not getattr(st, "ready", False) or not st.channel_exit:
+        if not getattr(st, "ready", False):
             return
         for pos in list(self.execution.positions.values()):
-            if (pos.product_id == pid and pos.strategy is StrategyName.TREND and not pos.closing
-                    and st.bar_close_ts > pos.opened_at):
-                await self._event("INFO", "EXIT", f"{pid}: cierre 6h {st.close:.6g} < canal {st.exit_level:.6g}")
-                asyncio.create_task(self.execution.close_position(pos.position_id, "SALIDA DE CANAL 6H"))
+            if (pos.product_id != pid or pos.strategy is not StrategyName.TREND or pos.closing
+                    or st.bar_close_ts <= pos.opened_at):
+                continue
+            if pos.is_short and st.channel_exit_short:
+                msg = f"{pid}: cierre 6h {st.close:.6g} > canal {st.short_exit_level:.6g} (corto)"
+            elif not pos.is_short and st.channel_exit:
+                msg = f"{pid}: cierre 6h {st.close:.6g} < canal {st.exit_level:.6g}"
+            else:
+                continue
+            await self._event("INFO", "EXIT", msg)
+            asyncio.create_task(self.execution.close_position(pos.position_id, "SALIDA DE CANAL 6H"))
 
     def _free_quote(self) -> float:
+        if self.perps:
+            # margen libre en nocional: equity·apalancamiento − nocional abierto − entradas en curso
+            open_notional = sum(p.size * (self.markets[p.product_id].book.mid or p.entry_price)
+                                for p in self.execution.positions.values())
+            pending = sum(t.size * t.price for t in self.execution.orders_by_cid.values()
+                          if t.purpose == "ENTRY" and not t.status.is_terminal)
+            return max(self.equity * self.s.risk.max_leverage - open_notional - pending, 0.0)
         cash = self.balances.get("USDC", 0.0)
         reserved = sum(
             t.size * t.price for t in self.execution.orders_by_cid.values()
@@ -690,7 +727,7 @@ class TradingEngine:
             return "RECHAZADO: LIVE requiere ALLOW_LIVE_TRADING=true y credenciales CDP"
         old_gateway = self.gateway
         if isinstance(old_gateway, PaperGateway):
-            await self.db.run(self.db.sync.set_kv, "paper_balances", old_gateway.balances)
+            await self.db.run(self.db.sync.set_kv, self.paper_key, old_gateway.balances)
         self.mode = new_mode
         self.gateway = self._build_gateway(new_mode)
         await self._load_market_metadata()
@@ -721,6 +758,11 @@ class TradingEngine:
             return
         quote = "USDC"
         cash = self.balances.get(quote, 0.0)
+        if self.perps:
+            # Perpetuos: equity = saldo + PnL flotante de la cuenta de futuros
+            eq = cash + self.balances.get("_unrealized", 0.0)
+            self.cash, self.equity, self.account_value = cash, eq, eq
+            return
         # Valor total de la cuenta en el universo (informativo)
         account = cash
         for pid, mk in self.markets.items():
@@ -750,10 +792,25 @@ class TradingEngine:
                     await self._event("CRITICAL", "DAILY_DD", evt.message)
                     self.notifier.notify_risk(evt.message)
                     await self.kill_switch(evt.message, lock_reason="daily_dd")
+            self._accrue_funding()
             await self._persist_risk()
             if isinstance(self.gateway, PaperGateway):
-                await self.db.run(self.db.sync.set_kv, "paper_balances", self.gateway.balances)
+                await self.db.run(self.db.sync.set_kv, self.paper_key, self.gateway.balances)
             await asyncio.sleep(self.s.runtime.equity_sample_s)
+
+    def _accrue_funding(self) -> None:
+        """Financiación de perpetuos: se carga (PAPER) y se imputa a cada posición (informe de PnL)."""
+        now = time.time()
+        last = getattr(self, "_funding_ts", now)
+        self._funding_ts = now
+        if not self.perps or now <= last:
+            return
+        rate = self.s.fees.funding_per_hour * (now - last) / 3600
+        for p in self.execution.positions.values():
+            px = self.markets[p.product_id].book.mid or p.entry_price
+            p.funding_paid += abs(p.size) * px * rate
+        if isinstance(self.gateway, PaperGateway):
+            self.gateway.charge_funding(rate)
 
     async def _persist_risk(self) -> None:
         await self.db.run(self.db.sync.set_kv, "risk_state", self.risk.state.to_json())
@@ -856,6 +913,8 @@ class TradingEngine:
             "signal_tf_minutes": (self.s.trend.tf_seconds // 60) if self.trend_enabled
                                  else self.s.strategy.regime_tf_minutes,
             "strategies": list(self.s.strategies),
+            "venue": self.s.venue,
+            "max_leverage": self.s.risk.max_leverage,
             "live_allowed": self.s.runtime.allow_live,
             "universe": list(self.s.pairs),
         }
@@ -931,7 +990,7 @@ class TradingEngine:
         await asyncio.gather(*self.tasks, return_exceptions=True)
         await self._persist_risk()
         if isinstance(self.gateway, PaperGateway):
-            await self.db.run(self.db.sync.set_kv, "paper_balances", self.gateway.balances)
+            await self.db.run(self.db.sync.set_kv, self.paper_key, self.gateway.balances)
         await self._publish_kv({"bot_status": "STOPPED", "engine_heartbeat": time.time()})
         for c in self.conns.values():
             if c.client:

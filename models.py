@@ -130,14 +130,29 @@ class Position:
     realized_gross: float = 0.0     # PnL bruto de parciales ya cerradas
     exit_fees_paid: float = 0.0
     closing: bool = False
+    side: str = "BUY"               # BUY = largo · SELL = corto
+    funding_paid: float = 0.0       # financiación de perpetuos imputada
+    lowest_price: float = 0.0       # extremo favorable de un corto
+
+    @property
+    def is_short(self) -> bool:
+        return self.side == "SELL"
+
+    @property
+    def direction(self) -> int:
+        return -1 if self.is_short else 1
 
     @property
     def r_value(self) -> float:
         """Riesgo inicial por unidad (1R)."""
-        return max(self.entry_price - self.initial_stop, 1e-12)
+        return max(abs(self.entry_price - self.initial_stop), 1e-12)
 
     def r_multiple(self, price: float) -> float:
-        return (price - self.entry_price) / self.r_value
+        return (price - self.entry_price) * self.direction / self.r_value
+
+    def gross_open(self, price: float) -> float:
+        """PnL bruto flotante de la parte abierta."""
+        return (price - self.entry_price) * self.size * self.direction
 
     def notional(self, price: float) -> float:
         return self.size * price

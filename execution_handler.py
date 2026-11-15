@@ -235,7 +235,10 @@ class ExecutionHandler:
         ex = self.s.execution
         mk = self.markets[signal.product_id]
         meta = self.gw.meta(signal.product_id)
-        max_price = signal.ref_price * (1 + ex.max_chase_slippage_pct / 100.0)
+        short = signal.side is Side.SELL
+        slip = ex.max_chase_slippage_pct / 100.0
+        max_price = signal.ref_price * (1 + slip)
+        min_price = signal.ref_price * (1 - slip)
         target = sizing.base_size
         risk_budget = sizing.risk_usd
         filled = cost = fees = 0.0
@@ -256,20 +259,26 @@ class ExecutionHandler:
                 if bid is None or ask is None:
                     reason = "libro no disponible"
                     break
-                # mejor bid; si hay ≥2 ticks de spread, mejora 1 tick (prioridad sin cruzar)
-                price = bid
-                if ask - bid >= 2 * meta.quote_increment - 1e-12:
-                    price = bid + meta.quote_increment
-                price = round_step(price, meta.quote_increment)
-                if price > max_price:
-                    reason = f"precio escapó {price:.6g} > máx {max_price:.6g}"
-                    break
+                # largo: mejor bid (+1 tick si hay ≥2 ticks de spread); corto: mejor ask (−1 tick)
+                wide = ask - bid >= 2 * meta.quote_increment - 1e-12
+                if short:
+                    price = round_step(ask - meta.quote_increment if wide else ask, meta.quote_increment, up=True)
+                    if price < min_price:
+                        reason = f"precio escapó {price:.6g} < mín {min_price:.6g}"
+                        break
+                else:
+                    price = round_step(bid + meta.quote_increment if wide else bid, meta.quote_increment)
+                    if price > max_price:
+                        reason = f"precio escapó {price:.6g} > máx {max_price:.6g}"
+                        break
                 valid_rr, rr = self.risk.check_entry_still_valid(
                     price, signal.stop_price, signal.take_profit,
                     self.strategy.maker_fee, self.strategy.taker_fee,
                 )
                 fh = fee_hurdle(price, signal.take_profit, mk.book.spread_pct or 0.0,
                                 self.strategy.maker_fee, self.s.fees)
+                if signal.strategy is StrategyName.TREND:   # sin TP fijo: el filtro de recorrido no aplica
+                    fh.ok = True
                 if not valid_rr or not fh.ok:
                     reason = f"RR neto {rr:.2f} / {fh.reason} roto al reprecio"
                     break
@@ -283,12 +292,12 @@ class ExecutionHandler:
                     break
                 current = TrackedOrder(
                     client_order_id=new_client_order_id(ex.order_prefix, "en"),
-                    product_id=signal.product_id, side=Side.BUY, purpose="ENTRY",
+                    product_id=signal.product_id, side=signal.side, purpose="ENTRY",
                     price=price, size=size,
                 )
                 self._track(current)
                 try:
-                    oid = await self.gw.place_post_only(signal.product_id, Side.BUY, size, price,
+                    oid = await self.gw.place_post_only(signal.product_id, signal.side, size, price,
                                                         current.client_order_id)
                 except PostOnlyRejected:
                     current.status = OrderStatus.REJECTED
@@ -349,6 +358,8 @@ class ExecutionHandler:
             opened_at=time.time(),
             obi_at_entry=signal.obi,
             highest_price=res.avg_price,
+            lowest_price=res.avg_price,
+            side=signal.side.value,
         )
         pos.tp_levels = self._build_tp_levels(pos, mk)
         self.positions[pos.position_id] = pos
@@ -356,7 +367,8 @@ class ExecutionHandler:
         await self._persist_position(pos)
         self.notifier.notify_entry(pos, signal, res, sizing, self.mode)
         self.db.fire(self.db.sync.log_event, "INFO", "ENTRY",
-                     f"{pos.product_id} BUY {pos.size} @ {pos.entry_price:.6g} ({signal.strategy.value})")
+                     f"{pos.product_id} {'SHORT' if pos.is_short else 'LONG'} {pos.size} @ {pos.entry_price:.6g} "
+                     f"({signal.strategy.value})")
 
     def _build_tp_levels(self, pos: Position, mk: MarketState) -> list[TPLevel]:
         if pos.strategy is StrategyName.TREND:
@@ -401,22 +413,25 @@ class ExecutionHandler:
                 continue
             mk = self.markets[pos.product_id]
             px = lv.price
-            bid = mk.book.best_bid
-            if bid is not None and px <= bid:  # ya alcanzado: un tick sobre el bid
+            close_side = Side.BUY if pos.is_short else Side.SELL
+            bid, ask = mk.book.best_bid, mk.book.best_ask
+            if not pos.is_short and bid is not None and px <= bid:   # ya alcanzado: un tick sobre el bid
                 px = bid + meta.quote_increment
+            if pos.is_short and ask is not None and px >= ask:      # ya alcanzado: un tick bajo el ask
+                px = ask - meta.quote_increment
             use_bracket = self.s.execution.exchange_stops
             trigger = self.exchange_stop_price(pos) if use_bracket else 0.0
             t = TrackedOrder(
                 client_order_id=new_client_order_id(self.s.execution.order_prefix, "tp"),
-                product_id=pos.product_id, side=Side.SELL, purpose="TAKE_PROFIT",
+                product_id=pos.product_id, side=close_side, purpose="TAKE_PROFIT",
                 price=px, size=qty, position_id=pos.position_id, stop_trigger=trigger,
             )
             self._track(t)
             try:
                 if use_bracket:
-                    oid = await self.gw.place_bracket_sell(pos.product_id, qty, px, trigger, t.client_order_id)
+                    oid = await self.gw.place_bracket(pos.product_id, close_side, qty, px, trigger, t.client_order_id)
                 else:
-                    oid = await self.gw.place_post_only(pos.product_id, Side.SELL, qty, px, t.client_order_id)
+                    oid = await self.gw.place_post_only(pos.product_id, close_side, qty, px, t.client_order_id)
             except PostOnlyRejected:
                 t.status = OrderStatus.REJECTED
                 continue
@@ -432,18 +447,24 @@ class ExecutionHandler:
             self._exchange_stop_ts[pos.position_id] = time.time()
 
     def exchange_stop_price(self, pos: Position) -> float:
-        """Stop de respaldo en el exchange: ligeramente por debajo del stop software."""
+        """Stop de respaldo en el exchange: ligeramente más allá del stop software (abajo en largos, arriba en cortos)."""
         meta = self.gw.meta(pos.product_id)
-        return round_step(pos.stop_price * (1 - self.s.execution.exchange_stop_buffer_pct / 100), meta.quote_increment)
+        buf = self.s.execution.exchange_stop_buffer_pct / 100
+        if pos.is_short:
+            return round_step(pos.stop_price * (1 + buf), meta.quote_increment, up=True)
+        return round_step(pos.stop_price * (1 - buf), meta.quote_increment)
 
     def _schedule_exchange_stop_update(self, pos: Position) -> None:
         if not self.s.execution.exchange_stops or pos.closing:
             return
         placed = self._exchange_stop_at.get(pos.position_id, 0.0)
         target = self.exchange_stop_price(pos)
-        # sólo si el stop sube de forma significativa (≥ 0.25 ATR) y con control de frecuencia
+        # sólo si el stop mejora de forma significativa (≥ 0.25 ATR) y con control de frecuencia
         min_step = 0.25 * (pos.atr_at_entry or 0.0)
-        if target <= placed + min_step and not (pos.breakeven_armed and placed < pos.entry_price):
+        if pos.is_short:
+            if placed and target >= placed - min_step:
+                return
+        elif target <= placed + min_step and not (pos.breakeven_armed and placed < pos.entry_price):
             return
         if time.time() - self._exchange_stop_ts.get(pos.position_id, 0.0) < self.s.execution.exchange_stop_min_update_s:
             return
@@ -480,7 +501,7 @@ class ExecutionHandler:
             return
         px = t.avg_price or t.price
         pos.size = max(pos.size - qty, 0.0)
-        pos.realized_gross += (px - pos.entry_price) * qty
+        pos.realized_gross += (px - pos.entry_price) * qty * pos.direction
         pos.exit_fees_paid += fee
         for lv in pos.tp_levels:
             if lv.client_order_id == t.client_order_id and t.status is OrderStatus.FILLED:
@@ -489,7 +510,8 @@ class ExecutionHandler:
         if t.status is OrderStatus.FILLED:
             self.notifier.notify_partial_tp(pos, px, qty, fee, self.mode)
         if pos.size < meta.base_min_size and not pos.closing:
-            reason = "STOP EN EXCHANGE" if t.stop_trigger and px <= t.stop_trigger * 1.01 else "TAKE PROFIT"
+            hit_stop = t.stop_trigger and (px >= t.stop_trigger * 0.99 if pos.is_short else px <= t.stop_trigger * 1.01)
+            reason = "STOP EN EXCHANGE" if hit_stop else "TAKE PROFIT"
             await self._finalize(pos, exit_price=px, reason=reason)
         else:
             await self._persist_position(pos)
@@ -502,27 +524,36 @@ class ExecutionHandler:
             if pos.closing:
                 continue
             mk = self.markets[pos.product_id]
-            bid = mk.book.best_bid
-            if bid is None:
+            bid, ask = mk.book.best_bid, mk.book.best_ask
+            if bid is None or (pos.is_short and ask is None):
                 continue
-            pos.highest_price = max(pos.highest_price, bid)
             changed = False
             if pos.strategy is StrategyName.TREND:
-                # Tendencia: trailing k·ATR(6h) desde el máximo, sin breakeven (igual que el backtest)
+                # Tendencia: trailing k·ATR(6h) desde el extremo favorable, sin breakeven (igual que el backtest)
                 st = self.strategy.trend.state.get(pos.product_id)
                 atr6 = st.atr if st is not None and st.ready else pos.atr_at_entry
-                trail = pos.highest_price - self.s.trend.k_atr * atr6
-                if trail > pos.stop_price:
-                    pos.stop_price = trail
-                    changed = True
-                if bid <= pos.stop_price:
+                k = self.s.trend.k_atr * atr6
+                if pos.is_short:
+                    pos.lowest_price = min(pos.lowest_price or ask, ask)
+                    trail = pos.lowest_price + k
+                    if trail < pos.stop_price:
+                        pos.stop_price, changed = trail, True
+                    hit, in_profit = ask >= pos.stop_price, pos.stop_price < pos.entry_price
+                else:
+                    pos.highest_price = max(pos.highest_price, bid)
+                    trail = pos.highest_price - k
+                    if trail > pos.stop_price:
+                        pos.stop_price, changed = trail, True
+                    hit, in_profit = bid <= pos.stop_price, pos.stop_price > pos.entry_price
+                if hit:
                     asyncio.create_task(self.close_position(
-                        pos.position_id, "TRAILING STOP" if pos.stop_price > pos.entry_price else "STOP LOSS"))
+                        pos.position_id, "TRAILING STOP" if in_profit else "STOP LOSS"))
                     continue
                 if changed:
                     await self._persist_position(pos)
                 self._schedule_exchange_stop_update(pos)
                 continue
+            pos.highest_price = max(pos.highest_price, bid)
             # 2) Fee-Adjusted Breakeven a +1.2R
             if not pos.breakeven_armed and pos.r_multiple(bid) >= be_trigger:
                 be = fee_adjusted_breakeven(pos.entry_price, pos.entry_fee_rate, self.strategy.taker_fee)
@@ -565,17 +596,19 @@ class ExecutionHandler:
             await asyncio.gather(*(self._cancel_and_settle(t) for t in tps))
             meta = self.gw.meta(pos.product_id)
             qty = round_step(pos.size, meta.base_increment)
-            exit_px = self.markets[pos.product_id].book.best_bid or pos.entry_price
+            book = self.markets[pos.product_id].book
+            exit_px = (book.best_ask if pos.is_short else book.best_bid) or pos.entry_price
+            close_side = Side.BUY if pos.is_short else Side.SELL
             if qty >= meta.base_min_size:
                 t = TrackedOrder(
                     client_order_id=new_client_order_id(self.s.execution.order_prefix, "ex"),
-                    product_id=pos.product_id, side=Side.SELL, purpose="EXIT",
+                    product_id=pos.product_id, side=close_side, purpose="EXIT",
                     price=0.0, size=qty, position_id=position_id,
                 )
                 self._track(t)
                 for attempt in range(3):
                     try:
-                        oid = await self.gw.place_market_sell(pos.product_id, qty, t.client_order_id)
+                        oid = await self.gw.place_market(pos.product_id, close_side, qty, t.client_order_id)
                         self._bind(t, oid)
                         break
                     except ExchangeError as exc:
@@ -590,7 +623,7 @@ class ExecutionHandler:
                     await self._sync_from_rest(t)
                 if t.filled > 0:
                     exit_px = t.avg_price or exit_px
-                    pos.realized_gross += (exit_px - pos.entry_price) * t.filled
+                    pos.realized_gross += (exit_px - pos.entry_price) * t.filled * pos.direction
                     pos.exit_fees_paid += t.fees
                     pos.size = max(pos.size - t.filled, 0.0)
             await self._finalize(pos, exit_price=exit_px, reason=reason)
@@ -600,12 +633,12 @@ class ExecutionHandler:
         for t in list(self.orders_by_cid.values()):
             if t.position_id == pos.position_id and not t.status.is_terminal and t.order_id:
                 await self._cancel_and_settle(t)
-        fees = pos.entry_fee_paid + pos.exit_fees_paid
+        fees = pos.entry_fee_paid + pos.exit_fees_paid + pos.funding_paid
         gross = pos.realized_gross
         net = gross - fees
         invested = pos.entry_price * pos.initial_size
         closed_qty = pos.initial_size - pos.size
-        avg_exit = pos.entry_price + gross / closed_qty if closed_qty > 0 else exit_price
+        avg_exit = pos.entry_price + gross / (closed_qty * pos.direction) if closed_qty > 0 else exit_price
         trade = {
             "trade_id": uuid.uuid4().hex[:12],
             "position_id": pos.position_id,
@@ -625,6 +658,8 @@ class ExecutionHandler:
             "mode": self.mode,
             "initial_stop": pos.initial_stop,
             "take_profit": pos.take_profit,
+            "side": pos.side,
+            "funding": pos.funding_paid,
         }
         self.closed_trades_cache.append(trade)
         await self.db.run(self.db.sync.insert_trade, trade)
@@ -679,7 +714,7 @@ class ExecutionHandler:
     # ═════════════════════════════════════════════════════════════════════
     def _position_row(self, pos: Position, status: str = "OPEN") -> dict[str, Any]:
         mk = self.markets[pos.product_id]
-        mark = mk.book.best_bid or mk.last_price
+        mark = (mk.book.best_ask if pos.is_short else mk.book.best_bid) or mk.last_price
         unreal = self.unrealized_net(pos, mark)
         state = asdict(pos)
         state["strategy"] = pos.strategy.value
@@ -695,7 +730,9 @@ class ExecutionHandler:
             "stop_price": pos.stop_price,
             "initial_stop": pos.initial_stop,
             "take_profit": pos.take_profit,
-            "breakeven_price": fee_adjusted_breakeven(pos.entry_price, pos.entry_fee_rate, self.strategy.taker_fee),
+            "breakeven_price": fee_adjusted_breakeven(pos.entry_price, pos.entry_fee_rate, self.strategy.taker_fee,
+                                                      short=pos.is_short),
+            "side": pos.side,
             "breakeven_armed": int(pos.breakeven_armed),
             "mark_price": mark,
             "unrealized_net": unreal,
@@ -711,9 +748,10 @@ class ExecutionHandler:
         """PnL neto flotante: incluye fees pagadas + fee taker estimada de salida."""
         if mark is None or math.isnan(mark):
             return 0.0
-        gross_open = (mark - pos.entry_price) * pos.size
+        gross_open = pos.gross_open(mark)
         exit_fee_est = mark * pos.size * self.strategy.taker_fee
-        return pos.realized_gross + gross_open - pos.entry_fee_paid - pos.exit_fees_paid - exit_fee_est
+        return (pos.realized_gross + gross_open - pos.entry_fee_paid - pos.exit_fees_paid
+                - pos.funding_paid - exit_fee_est)
 
     async def _persist_position(self, pos: Position) -> None:
         await self.db.run(self.db.sync.upsert_position, self._position_row(pos))
@@ -749,7 +787,7 @@ class ExecutionHandler:
                     continue
                 t = TrackedOrder(
                     client_order_id=upd.client_order_id or lv.client_order_id or "",
-                    product_id=pos.product_id, side=Side.SELL, purpose="TAKE_PROFIT",
+                    product_id=pos.product_id, side=Side.BUY if pos.is_short else Side.SELL, purpose="TAKE_PROFIT",
                     price=lv.price, size=upd.filled_size + upd.leaves_size, position_id=pos.position_id,
                     order_id=upd.order_id, status=upd.status, filled=upd.filled_size,
                     avg_price=upd.avg_price, fees=upd.total_fees,

@@ -115,6 +115,10 @@ Transfer). Para `TELEGRAM_CHAT_ID` habla con tu bot y consulta `getUpdates`.
 
 ## 5. Lógica clave
 
+> **Mercado por defecto: perpetuos US de Coinbase (`VENUE=PERPS`)** — BTC `BIP-20DEC30-CDE`, ETH
+> `ETP-20DEC30-CDE`, SOL `SLP-20DEC30-CDE`, SUI `SUP-20DEC30-CDE`. Largo **y corto**, apalancamiento máx.
+> 2×, comisiones ~20× menores que spot (ver `docs/BACKTEST.md` §3). `VENUE=SPOT` vuelve al modo solo-largo.
+>
 > **Estrategia activa por defecto: `TREND_6H`** (seguimiento de tendencia en velas de 6 h), elegida tras
 > el backtest documentado en [`docs/BACKTEST.md`](docs/BACKTEST.md): las estrategias intradía de abajo
 > no superan las comisiones de Coinbase. Siguen disponibles con `STRATEGIES=BREAKOUT_ORDERFLOW,MEAN_REVERSION_MICRO`.

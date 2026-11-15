@@ -69,18 +69,23 @@ class RiskEvent:
     data: dict[str, Any] = field(default_factory=dict)
 
 
-def fee_adjusted_breakeven(entry: float, entry_fee_rate: float, exit_fee_rate: float) -> float:
+def fee_adjusted_breakeven(entry: float, entry_fee_rate: float, exit_fee_rate: float, short: bool = False) -> float:
     """
     Precio de salida con PnL neto = 0:
-        exit·(1 − f_exit) = entry·(1 + f_entry)  ⇒  exit = entry·(1+f_entry)/(1−f_exit)
+        largo:  exit·(1 − f_exit) = entry·(1 + f_entry)  ⇒  exit = entry·(1+f_entry)/(1−f_exit)
+        corto:  entry·(1 − f_entry) = exit·(1 + f_exit)  ⇒  exit = entry·(1−f_entry)/(1+f_exit)
     """
+    if short:
+        return entry * (1.0 - entry_fee_rate) / (1.0 + exit_fee_rate)
     return entry * (1.0 + entry_fee_rate) / (1.0 - exit_fee_rate)
 
 
 def net_reward_risk(entry: float, stop: float, tp: float, maker: float, taker: float) -> tuple[float, float, float]:
-    """(recompensa neta/unidad, riesgo neto/unidad, RR neto). TP como maker, stop como taker."""
-    reward = (tp - entry) - entry * maker - tp * maker
-    risk = (entry - stop) + entry * maker + stop * taker
+    """(recompensa neta/unidad, riesgo neto/unidad, RR neto). TP como maker, stop como taker.
+    El sentido se deduce del stop: stop < entrada ⇒ largo; stop > entrada ⇒ corto."""
+    d = 1.0 if stop < entry else -1.0
+    reward = (tp - entry) * d - entry * maker - tp * maker
+    risk = (entry - stop) * d + entry * maker + stop * taker
     return reward, risk, (reward / risk if risk > 0 else 0.0)
 
 
@@ -242,7 +247,8 @@ class RiskManager:
     ) -> SizingResult:
         pcfg = self.pairs[signal.product_id]
         reward_u, risk_u, rr = net_reward_risk(entry_price, signal.stop_price, signal.take_profit, maker, taker)
-        if risk_u <= 0 or entry_price <= signal.stop_price:
+        short = signal.side.value == "SELL"
+        if risk_u <= 0 or (entry_price <= signal.stop_price if not short else entry_price >= signal.stop_price):
             return SizingResult(0, 0, 0, 0, "-", rr, "Stop inválido", ok=False)
         if rr < self.min_net_rr:
             return SizingResult(0, 0, 0, 0, "-", rr, f"RR neto {rr:.2f} < {self.min_net_rr:.2f}", ok=False)
@@ -255,7 +261,7 @@ class RiskManager:
             method = f"QUARTER_KELLY({qk*100:.2f}%)"
         risk_usd = equity * risk_frac
         size = risk_usd / risk_u
-        cap_alloc = pcfg.max_allocation * equity / entry_price
+        cap_alloc = pcfg.max_allocation * equity * max(self.cfg.max_leverage, 1.0) / entry_price
         cap_cash = max(free_quote * 0.98, 0.0) / (entry_price * (1 + maker))
         capped_by = ""
         if size > cap_alloc:

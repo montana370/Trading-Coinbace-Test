@@ -40,6 +40,21 @@ def _env_bool(name: str, default: bool) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 0. Mercado: SPOT (sólo largo) o PERPS (perpetuos US de Coinbase, largo y corto)
+# ─────────────────────────────────────────────────────────────────────────────
+VENUE = _env_str("VENUE", "PERPS").upper()
+IS_PERPS = VENUE == "PERPS"
+
+# Perpetuos US (Coinbase Financial Markets, CFTC). El tamaño del contrato se lee de la API.
+PERP_PRODUCTS = {
+    "SOL-USDC": "SLP-20DEC30-CDE",
+    "BTC-USDC": "BIP-20DEC30-CDE",
+    "ETH-USDC": "ETP-20DEC30-CDE",
+    "SUI-USDC": "SUP-20DEC30-CDE",
+}
+
+
 class PairRole(str, Enum):
     ALPHA_ENGINE = "Motor Principal de Alfa"
     LIQUIDITY_ANCHOR = "Ancla de Liquidez y Oráculo Macro"
@@ -55,6 +70,11 @@ class PairConfig:
     max_spread_pct: float          # spread máximo permitido en % (0.04 = 0.04 %)
     allow_trend: bool              # Estrategia 1 habilitada
     allow_mean_reversion: bool     # Estrategia 2 habilitada
+    venue_id: str = ""             # producto real en Coinbase (perpetuo o el propio spot)
+
+    @property
+    def exchange_id(self) -> str:
+        return self.venue_id or self.product_id
 
     @property
     def base_currency(self) -> str:
@@ -70,11 +90,18 @@ class PairConfig:
 # ─────────────────────────────────────────────────────────────────────────────
 ORACLE_PRODUCT = "BTC-USDC"
 
+# Spread máx: en spot el precalibrado original; en perpetuos el libro es más ancho
+# (tick de $5 en BTC) y el límite se adapta a lo observado (~0.03 % BTC, ~0.11 % SUI).
+_SPREAD = {"SOL-USDC": (0.04, 0.10), "BTC-USDC": (0.02, 0.06), "ETH-USDC": (0.03, 0.08), "SUI-USDC": (0.06, 0.20)}
 PAIRS: dict[str, PairConfig] = {
-    "SOL-USDC": PairConfig("SOL-USDC", PairRole.ALPHA_ENGINE, 0.35, 0.04, True, True),
-    "BTC-USDC": PairConfig("BTC-USDC", PairRole.LIQUIDITY_ANCHOR, 0.30, 0.02, True, True),
-    "ETH-USDC": PairConfig("ETH-USDC", PairRole.MEAN_REVERSION, 0.20, 0.03, False, True),
-    "SUI-USDC": PairConfig("SUI-USDC", PairRole.MOMENTUM, 0.15, 0.06, True, False),
+    pid: PairConfig(pid, role, alloc, _SPREAD[pid][1 if IS_PERPS else 0], trend, mr,
+                    PERP_PRODUCTS[pid] if IS_PERPS else pid)
+    for pid, role, alloc, trend, mr in (
+        ("SOL-USDC", PairRole.ALPHA_ENGINE, 0.35, True, True),
+        ("BTC-USDC", PairRole.LIQUIDITY_ANCHOR, 0.30, True, True),
+        ("ETH-USDC", PairRole.MEAN_REVERSION, 0.20, False, True),
+        ("SUI-USDC", PairRole.MOMENTUM, 0.15, True, False),
+    )
 }
 PRODUCT_IDS: list[str] = list(PAIRS.keys())
 QUOTE_CURRENCY = "USDC"
@@ -106,8 +133,11 @@ class Credentials:
 # ─────────────────────────────────────────────────────────────────────────────
 @dataclass(frozen=True)
 class FeeConfig:
-    maker_fee: float = _env_float("MAKER_FEE", 0.0040)      # 0.40 %
-    taker_fee: float = _env_float("TAKER_FEE", 0.0060)      # 0.60 %
+    # Spot: 0.40 % / 0.60 %. Perpetuos US: supuestos conservadores 0.02 % / 0.05 %.
+    maker_fee: float = _env_float("MAKER_FEE", 0.0002 if IS_PERPS else 0.0040)
+    taker_fee: float = _env_float("TAKER_FEE", 0.0005 if IS_PERPS else 0.0060)
+    # Financiación de perpetuos (PAPER): coste por hora cargado a cualquier posición.
+    funding_per_hour: float = _env_float("FUNDING_PER_HOUR", 0.0001 / 8)
     # Si True, el motor consulta get_transaction_summary() y usa el tier real
     # (nunca por debajo de los valores configurados: modelo conservador).
     fetch_live_fee_tier: bool = _env_bool("FETCH_LIVE_FEE_TIER", True)
@@ -207,8 +237,11 @@ class TrendConfig:
     tf_seconds: int = 21600
     granularity: str = "SIX_HOUR"
     n_entry: int = _env_int("TREND_N_ENTRY", 20)
-    n_exit: int = _env_int("TREND_N_EXIT", 20)
-    k_atr: float = _env_float("TREND_K_ATR", 5.0)
+    # Perpetuos (largo/corto): N=20, M=10, k=2.5 · Spot (sólo largo): N=20, M=20, k=5.0
+    n_exit: int = _env_int("TREND_N_EXIT", 10 if IS_PERPS else 20)
+    k_atr: float = _env_float("TREND_K_ATR", 2.5 if IS_PERPS else 5.0)
+    allow_short: bool = _env_bool("ALLOW_SHORT", IS_PERPS)
+    obi_wall_veto: float = 0.35              # no comprar con OBI ≤ −0.35 ni vender en corto con OBI ≥ +0.35
     ema_period: int = 200
     atr_period: int = 14
     history_bars: int = 300                  # 75 días de velas de 6 h
@@ -231,6 +264,7 @@ class OracleConfig:
 @dataclass(frozen=True)
 class RiskConfig:
     risk_per_trade: float = _env_float("RISK_PER_TRADE", 0.01)       # 1 % equity
+    max_leverage: float = _env_float("MAX_LEVERAGE", 2.0 if IS_PERPS else 1.0)
     use_kelly: bool = _env_bool("USE_KELLY", True)
     kelly_fraction: float = 0.25                                     # Quarter-Kelly
     kelly_min_trades: int = 30
@@ -273,6 +307,7 @@ class Settings:
     risk: RiskConfig = field(default_factory=RiskConfig)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
     pairs: dict[str, PairConfig] = field(default_factory=lambda: dict(PAIRS))
+    venue: str = VENUE
 
 
 SETTINGS = Settings()

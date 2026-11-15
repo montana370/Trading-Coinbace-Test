@@ -229,6 +229,7 @@ def _position_view(p: dict[str, Any]) -> dict[str, Any]:
     mark = p.get("mark_price") or p["entry_price"]
     return {
         "position_id": p["position_id"], "product_id": p["product_id"], "strategy": p["strategy"],
+        "side": p.get("side") or st.get("side") or "BUY",
         "regime": p["regime"], "entry_price": p["entry_price"], "size": p["size"],
         "initial_size": p["initial_size"], "stop_price": p["stop_price"], "initial_stop": p["initial_stop"],
         "take_profit": p["take_profit"], "breakeven_price": p["breakeven_price"],
@@ -264,7 +265,7 @@ async def state() -> JSONResponse:
             "bot_status", "status_detail", "mode", "ws_latency_ms", "api_latency_ms", "heartbeat_age_s",
             "ws_connected", "oracle", "equity", "cash", "day_start_equity", "daily_dd_pct", "fees",
             "consecutive_losses", "open_positions", "max_open_positions", "credentials_source", "live_allowed",
-            "signal_tf_minutes", "account_value",
+            "signal_tf_minutes", "account_value", "venue", "max_leverage",
         )},
         "pairs": [pairs[p] for p in SETTINGS.pairs],
         "positions": [_position_view(p) for p in db.open_positions(mode)],
